@@ -2,7 +2,7 @@
 
 Pulls decklists from Bushiroad's **Deck Log** by deck code — from either
 the English site (`decklog-en.bushiroad.com`) or the Japanese site
-(`decklog.bushiroad.com`) — and stores them in an Excel workbook you can
+(`decklog.bushiroad.com`) — and stores them in a SQLite database you can
 query for card frequency across many decks, optionally weighted by
 tournament placement.
 
@@ -17,6 +17,36 @@ playwright install chromium
 second command does.)
 
 ## Usage
+
+**Desktop GUI** — opens a window for importing decks and browsing the card report:
+
+```bash
+python decklog_gui.py
+```
+
+The GUI uses the same SQLite database and scraper as the command-line interface.
+Choose **Cardfight Vanguard** or **Weiss Schwarz** from the game selector; each
+uses its own database file (`cardfight_vanguard.db` or `weiss_schwarz.db`). Enter
+a Deck Log code, select EN or JP, optionally enter the tournament date in
+`YYYY-MM-DD` format, and click **Fetch and save deck**. The imported decks and
+weighted card report refresh automatically.
+
+Deck imports automatically identify Cardfight Vanguard or Weiss Schwarz from
+the card image source returned by Deck Log and save to the matching database.
+The selected game is used as a fallback when Deck Log returns no recognizable
+card image metadata.
+
+To import a complete tournament, paste its results-page URL into **Tournament
+page URL**, enter an event name, and click **Import entire tournament**. The GUI
+renders the page, follows every Deck Log link it finds, and stores the page's
+rank (including team ranks such as `1A`, `1B`, and `1C`) as the deck placement.
+An optional tournament date is applied to every imported deck.
+Individual deck failures are reported while the remaining entries continue.
+VG-Paradox English Singles/Teams pages and Japanese result pages are supported.
+
+Use the filter bar to narrow both the imported-decks list and card report by
+tournament name, import date range, and nation. Dates are selected from the
+calendar controls. `Energy Generator` is excluded from card reports.
 
 **Interactive mode** — asks for a code, asks EN or JP, asks for an event
 name and placement, saves it, and loops until you leave the code blank:
@@ -43,25 +73,20 @@ python decklog_tracker.py query --top 25          # only the top 25
 python decklog_tracker.py query --unweighted       # raw copy counts, ignore placement
 ```
 
-**Point at a different workbook** (default is `decklog_data.xlsx` in the
-current folder):
+**Point at a different database** with `--file`. The GUI's default game files
+are `cardfight_vanguard.db` and `weiss_schwarz.db` inside this project folder:
 
 ```bash
-python decklog_tracker.py --file my_decks.xlsx query
+python decklog_tracker.py --file my_decks.db query
 ```
 
-## The workbook
+## The database
 
-- **Decks** — one row per deck you've added: code, site, deck title, Nation,
-  regulation, event, placement, date added, total/unique card counts, and URL.
-- **Cards** — one row per card per deck (long/normalized format). This is
-  what the query aggregates over.
-- **PlacementWeights** — editable table mapping a placement label (e.g.
-  `1st`, `Top4`, `Top8`) to a numeric weight used by the weighted query.
-  Edit this sheet directly in Excel to change how much a 1st-place finish
-  should count versus a Top32. If you type a placement that isn't in this
-  table yet, it gets added automatically with weight `1` so you can go
-  back and adjust it later.
+The SQLite database contains `decks`, `cards`, and `placement_weights` tables.
+Each deck keeps both its automatic import timestamp (`date_added`) and optional
+event date (`tournament_date`).
+Deck updates are unique by site and deck code, card reports use indexed SQL
+aggregation, and unknown placement labels are added with weight `1`.
 
 ## If scraping comes back empty
 
@@ -80,7 +105,7 @@ python decklog_tracker.py --debug add 53V7L --site EN
 ```
 
 This saves a screenshot and the full rendered HTML to a `debug/` folder
-next to your workbook. Send those over (or open them yourself) and the
+next to your database. Send those over (or open them yourself) and the
 selectors in `fetch_decklist()` / `_parse_card_tile()` in
 `decklog_tracker.py` can be adjusted — that logic is deliberately kept in
 one small, isolated function for exactly this reason.
@@ -95,7 +120,7 @@ one small, isolated function for exactly this reason.
   can be fetched (i.e. the same as opening the `/view/<code>` link
   yourself in a browser).
 - This hasn't been run against the live site from this environment (no
-  outbound network access here) — the Excel storage, dedup-on-re-add, and
+  outbound network access here) — the SQLite storage, dedup-on-re-add, and
   weighted-query logic are unit-tested and confirmed working; the DOM
   scraping is implemented against the documented/known markup and should
   work, but flag it via `--debug` if a real code comes back empty and

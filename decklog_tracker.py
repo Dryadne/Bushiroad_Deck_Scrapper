@@ -4,7 +4,7 @@ decklog_tracker.py
 
 Pulls decklists from Bushiroad's "Deck Log" tool by deck code, from either
 the English site (decklog-en.bushiroad.com) or the Japanese site
-(decklog.bushiroad.com), and stores them in an Excel workbook so they can
+(decklog.bushiroad.com), and stores them in a SQLite database so they can
 be queried for card frequency across many decks -- optionally weighted by
 tournament placement.
 
@@ -31,22 +31,22 @@ Interactive mode (asks you for a code, EN/JP, event, placement, loops):
 Add one deck non-interactively:
     python decklog_tracker.py add 53V7L --site EN --event "Regional Q3" --placement "Top8"
 
-Re-scrape a deck already in the workbook (updates it in place):
+Re-scrape a deck already in the database (updates it in place):
     python decklog_tracker.py add 53V7L --site EN
 
 Run the card-frequency report:
     python decklog_tracker.py query
     python decklog_tracker.py query --top 25 --unweighted
 
-All commands accept --file to point at a different workbook
-(default: decklog_data.xlsx in the current directory).
+All commands accept --file to point at a different SQLite database
+(default: decklog_data.db in the current directory).
 
 IF SCRAPING BREAKS
 -------------------
 Deck Log's markup could change, or the JP site's DOM could differ from
 what the EN site's export tools assume. If `add` comes back with zero
 cards, run with --debug: it saves a screenshot and the full page HTML
-next to the workbook so you (or I) can see what changed and fix the
+next to the database so you (or I) can see what changed and fix the
 selectors in `fetch_decklist()` below.
 """
 
@@ -55,6 +55,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import re
+import sqlite3
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,13 +66,6 @@ except ImportError:
     print("Missing dependency. Run: pip install -r requirements.txt", file=sys.stderr)
     raise
 
-try:
-    from openpyxl import Workbook, load_workbook
-    from openpyxl.worksheet.worksheet import Worksheet
-    from openpyxl.utils import get_column_letter
-except ImportError:
-    print("Missing dependency. Run: pip install -r requirements.txt", file=sys.stderr)
-    raise
 
 
 # --------------------------------------------------------------------------
@@ -83,20 +77,7 @@ SITE_URLS = {
     "JP": "https://decklog.bushiroad.com/view/{code}",
 }
 
-DEFAULT_WORKBOOK = "decklog_data.xlsx"
-
-DECKS_SHEET = "Decks"
-CARDS_SHEET = "Cards"
-WEIGHTS_SHEET = "PlacementWeights"
-
-DECKS_HEADERS = [
-    "Deck Code", "Site", "Game", "Deck Title", "Nation", "Regulation", "Date Added", "Deck URL",
-    "Event / Tournament", "Placement", "Total Cards", "Unique Cards",
-]
-CARDS_HEADERS = [
-    "Deck Code", "Card Name", "Card Number", "Quantity",
-    "Site", "Event / Tournament", "Placement", "Weight", "Image Ref",
-]
+DEFAULT_DATABASE = str(Path(__file__).resolve().parent / "decklog_data.db")
 DEFAULT_WEIGHTS = [
     ("1st", 5),
     ("2nd", 4),
@@ -132,6 +113,18 @@ class DeckResult:
     cards: list[CardEntry] = field(default_factory=list)
 
 
+@dataclass
+class TournamentEntry:
+    rank: str
+    deck_code: str
+    site: str
+    deck_url: str
+    player_or_team: str = ""
+
+
+SUPPORTED_GAMES = ("Cardfight Vanguard", "Weiss Schwarz")
+
+
 # Selector used by Deck Log's card tiles. This is the same selector the
 # christopherkade/cfv-deck-exporter tool and Cardmarket bookmarklet rely on
 # for the EN site. If Deck Log changes its markup, or the JP site differs,
@@ -147,6 +140,16 @@ CARD_TILE_SELECTORS = [
 def normalize_deck_title(title: str) -> str:
     title = re.sub(r"\s+deck$", "", (title or "").strip(), flags=re.IGNORECASE).strip()
     return re.sub(r"^Deck Name\s*\[([^]]*)\]$", r"\1", title, flags=re.IGNORECASE).strip()
+
+
+def infer_game_from_cards(cards: list[CardEntry]) -> str:
+    """Infer the game from Deck Log's card image host/path."""
+    image_refs = " ".join(card.image_ref.lower() for card in cards)
+    if "cf-vanguard.com" in image_refs or "vanguard" in image_refs:
+        return "Cardfight Vanguard"
+    if "ws-tcg.com" in image_refs or "weiss" in image_refs:
+        return "Weiss Schwarz"
+    return ""
 
 
 def fetch_decklist(code: str, site: str, debug_dir: Path | None = None, headless: bool = True) -> DeckResult:
@@ -232,6 +235,10 @@ def fetch_decklist(code: str, site: str, debug_dir: Path | None = None, headless
                     if entry is not None:
                         cards.append(entry)
 
+                detected_game = infer_game_from_cards(cards)
+                if detected_game:
+                    game_title = detected_game
+
                 if debug_dir is not None:
                     debug_dir.mkdir(parents=True, exist_ok=True)
                     (debug_dir / f"{site}_{code}.html").write_text(page_content, encoding="utf-8")
@@ -258,6 +265,65 @@ def fetch_decklist(code: str, site: str, debug_dir: Path | None = None, headless
     if last_error is not None:
         raise RuntimeError(f"Failed to fetch deck {code} from {site}: {last_error}") from last_error
     raise RuntimeError(f"Failed to fetch deck {code} from {site}: unknown error")
+
+
+def fetch_tournament_entries(url: str, headless: bool = True) -> list[TournamentEntry]:
+    """Render a tournament page and return its ranked Deck Log links.
+
+    VG-Paradox tournament pages populate ``#data-output`` in JavaScript, so
+    this intentionally uses the same browser-rendered approach as deck fetch.
+    Other pages with a table of links can also work when their rows contain a
+    Deck Log URL with a ``/view/<code>`` path.
+    """
+    if not url.strip():
+        raise ValueError("tournament URL cannot be blank")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        page = browser.new_page(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128.0 Safari/537.36",
+            locale="en-US",
+            viewport={"width": 1440, "height": 1200},
+        )
+        try:
+            response = page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            if response is not None and response.status >= 400:
+                raise RuntimeError(f"HTTP {response.status} while loading tournament page")
+            page.wait_for_timeout(2500)
+
+            row_selector = "#data-output tr, #data-outputSingles tr, #data-outputTeams tr"
+            try:
+                page.locator(row_selector).first.wait_for(state="attached", timeout=10_000)
+            except PlaywrightTimeoutError:
+                pass
+            rows = page.locator(row_selector)
+            entries: list[TournamentEntry] = []
+            for row_index in range(rows.count()):
+                row = rows.nth(row_index)
+                cells = row.locator("td")
+                if cells.count() == 0:
+                    continue
+                rank = (cells.nth(0).text_content() or "").strip()
+                rank = re.sub(r"[A-Za-z]+$", "", rank).strip() or rank
+                player_or_team = (cells.nth(1).text_content() or "").strip() if cells.count() > 1 else ""
+                links = row.locator("a[href]")
+                for link_index in range(links.count()):
+                    href = (links.nth(link_index).get_attribute("href") or "").strip()
+                    match = re.search(r"decklog(?:-en)?\.bushiroad\.com/view/([^/?#]+)", href, flags=re.IGNORECASE)
+                    if not match:
+                        continue
+                    site = "EN" if "decklog-en" in href.lower() else "JP"
+                    entries.append(TournamentEntry(
+                        rank=rank or "Unknown",
+                        deck_code=match.group(1),
+                        site=site,
+                        deck_url=href,
+                        player_or_team=player_or_team,
+                    ))
+                    break
+            return entries
+        finally:
+            browser.close()
 
 
 def _parse_card_tile(tile) -> CardEntry | None:
@@ -346,148 +412,178 @@ def _parse_card_tile(tile) -> CardEntry | None:
 
 
 # --------------------------------------------------------------------------
-# Excel storage
+# SQLite storage
 # --------------------------------------------------------------------------
 
-def open_or_create_workbook(path: Path) -> Workbook:
-    if path.exists():
-        wb = load_workbook(path)
-        decks_ws = wb[DECKS_SHEET]
-        existing_headers = [cell.value for cell in decks_ws[1]]
-        for header in DECKS_HEADERS:
-            if header not in existing_headers:
-                decks_ws.cell(row=1, column=decks_ws.max_column + 1, value=header)
-        header_to_column = {cell.value: cell.column for cell in decks_ws[1]}
-        title_column = header_to_column.get("Deck Title")
-        if title_column:
-            for row in range(2, decks_ws.max_row + 1):
-                cell = decks_ws.cell(row=row, column=title_column)
-                if cell.value:
-                    cell.value = normalize_deck_title(str(cell.value))
-        _autosize(decks_ws)
-        return wb
+def open_database(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(path)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA foreign_keys = ON")
+    db.execute("PRAGMA journal_mode = WAL")
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS decks (
+            id INTEGER PRIMARY KEY,
+            deck_code TEXT NOT NULL,
+            site TEXT NOT NULL,
+            game TEXT NOT NULL DEFAULT '',
+            deck_title TEXT NOT NULL DEFAULT '',
+            nation TEXT NOT NULL DEFAULT '',
+            regulation TEXT NOT NULL DEFAULT '',
+            date_added TEXT NOT NULL,
+            tournament_date TEXT NOT NULL DEFAULT '',
+            deck_url TEXT NOT NULL,
+            event TEXT NOT NULL DEFAULT '',
+            placement TEXT NOT NULL DEFAULT '',
+            total_cards INTEGER NOT NULL DEFAULT 0,
+            unique_cards INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(deck_code, site)
+        );
+        CREATE TABLE IF NOT EXISTS cards (
+            id INTEGER PRIMARY KEY,
+            deck_id INTEGER NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
+            deck_code TEXT NOT NULL,
+            card_name TEXT NOT NULL,
+            card_number TEXT NOT NULL DEFAULT '',
+            quantity INTEGER NOT NULL,
+            site TEXT NOT NULL,
+            event TEXT NOT NULL DEFAULT '',
+            placement TEXT NOT NULL DEFAULT '',
+            weight REAL NOT NULL DEFAULT 1,
+            image_ref TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS placement_weights (
+            placement TEXT PRIMARY KEY,
+            weight REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS cards_name_idx ON cards(card_name);
+        CREATE INDEX IF NOT EXISTS cards_deck_idx ON cards(deck_id);
+        CREATE INDEX IF NOT EXISTS decks_event_idx ON decks(event);
+    """)
+    deck_columns = {row[1] for row in db.execute("PRAGMA table_info(decks)")}
+    if "tournament_date" not in deck_columns:
+        db.execute("ALTER TABLE decks ADD COLUMN tournament_date TEXT NOT NULL DEFAULT ''")
+    db.execute("CREATE INDEX IF NOT EXISTS decks_tournament_date_idx ON decks(tournament_date)")
+    db.executemany(
+        "INSERT OR IGNORE INTO placement_weights (placement, weight) VALUES (?, ?)",
+        DEFAULT_WEIGHTS,
+    )
+    db.commit()
+    return db
 
-    wb = Workbook()
-    default_ws = wb.active
-    wb.remove(default_ws)
 
-    decks_ws = wb.create_sheet(DECKS_SHEET)
-    decks_ws.append(DECKS_HEADERS)
-
-    cards_ws = wb.create_sheet(CARDS_SHEET)
-    cards_ws.append(CARDS_HEADERS)
-
-    weights_ws = wb.create_sheet(WEIGHTS_SHEET)
-    weights_ws.append(["Placement Label", "Weight"])
-    for label, weight in DEFAULT_WEIGHTS:
-        weights_ws.append([label, weight])
-
-    _autosize(decks_ws)
-    _autosize(cards_ws)
-    _autosize(weights_ws)
-    return wb
-
-
-def _autosize(ws: Worksheet, max_width: int = 40) -> None:
-    for i, col_cells in enumerate(ws.columns, start=1):
-        length = max((len(str(c.value)) for c in col_cells if c.value is not None), default=8)
-        ws.column_dimensions[get_column_letter(i)].width = min(length + 2, max_width)
-
-
-def get_placement_weight(wb: Workbook, placement: str) -> float:
-    ws = wb[WEIGHTS_SHEET]
+def get_placement_weight(db: sqlite3.Connection, placement: str) -> float:
     placement_norm = (placement or "Unknown").strip().lower()
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        label, weight = row[0], row[1]
-        if label and str(label).strip().lower() == placement_norm:
-            return float(weight)
-    # Unknown placement label: add it with weight 1 so the user can edit
-    # it later in the PlacementWeights sheet, and use 1 for now.
-    ws.append([placement or "Unknown", 1])
+    numeric_rank = re.fullmatch(r"\d+", placement_norm)
+    if numeric_rank:
+        rank = int(numeric_rank.group())
+        if rank == 1:
+            placement_norm = "1st"
+        elif rank == 2:
+            placement_norm = "2nd"
+        elif rank in (3, 4):
+            placement_norm = "top4"
+        elif 5 <= rank <= 8:
+            placement_norm = "top8"
+    row = db.execute(
+        "SELECT weight FROM placement_weights WHERE lower(placement) = ?",
+        (placement_norm,),
+    ).fetchone()
+    if row is not None:
+        return float(row["weight"])
+    db.execute(
+        "INSERT OR IGNORE INTO placement_weights (placement, weight) VALUES (?, 1)",
+        (placement or "Unknown",),
+    )
+    db.commit()
     return 1.0
 
 
-def remove_existing_deck(wb: Workbook, code: str, site: str) -> None:
-    """If this deck code (for this site) was already imported, strip its
-    old rows out of both sheets before re-inserting, so re-running `add`
-    on the same code updates it instead of duplicating it."""
-    for sheet_name, code_col in ((DECKS_SHEET, 0), (CARDS_SHEET, 0)):
-        ws = wb[sheet_name]
-        site_col = 1 if sheet_name == DECKS_SHEET else 4
-        rows_to_delete = [
-            row[0].row for row in ws.iter_rows(min_row=2)
-            if row[code_col].value == code and row[site_col].value == site
-        ]
-        for row_idx in reversed(rows_to_delete):
-            ws.delete_rows(row_idx)
-
-
-def save_deck(wb: Workbook, deck: DeckResult, event: str, placement: str) -> None:
-    remove_existing_deck(wb, deck.code, deck.site)
-    weight = get_placement_weight(wb, placement) if placement else 1.0
-
-    decks_ws = wb[DECKS_SHEET]
-    deck_values = {
-        "Deck Code": deck.code,
-        "Site": deck.site,
-        "Game": deck.game_title,
-        "Deck Title": deck.deck_title,
-        "Nation": deck.nation,
-        "Regulation": deck.regulation,
-        "Date Added": dt.datetime.now().isoformat(timespec="seconds"),
-        "Deck URL": deck.url,
-        "Event / Tournament": event or "",
-        "Placement": placement or "",
-        "Total Cards": sum(c.quantity for c in deck.cards),
-        "Unique Cards": len(deck.cards),
-    }
-    header_to_column = {cell.value: cell.column for cell in decks_ws[1]}
-    row = decks_ws.max_row + 1
-    for header, value in deck_values.items():
-        decks_ws.cell(row=row, column=header_to_column[header], value=value)
-
-    cards_ws = wb[CARDS_SHEET]
-    for c in deck.cards:
-        cards_ws.append([
-            deck.code, c.name, c.card_number, c.quantity,
-            deck.site, event or "", placement or "", weight, c.image_ref,
-        ])
+def save_deck(
+    db: sqlite3.Connection,
+    deck: DeckResult,
+    event: str,
+    placement: str,
+    tournament_date: str = "",
+) -> None:
+    event = event or ""
+    placement = placement or ""
+    tournament_date = (tournament_date or "").strip()
+    if tournament_date:
+        try:
+            dt.date.fromisoformat(tournament_date)
+        except ValueError as exc:
+            raise ValueError("tournament date must use YYYY-MM-DD format") from exc
+    weight = get_placement_weight(db, placement) if placement else 1.0
+    db.execute("DELETE FROM decks WHERE deck_code = ? AND site = ?", (deck.code, deck.site))
+    cursor = db.execute(
+        """INSERT INTO decks
+        (deck_code, site, game, deck_title, nation, regulation, date_added,
+         tournament_date, deck_url, event, placement, total_cards, unique_cards)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (deck.code, deck.site, deck.game_title, deck.deck_title, deck.nation,
+         deck.regulation, dt.datetime.now().isoformat(timespec="seconds"),
+         tournament_date, deck.url, event, placement, sum(c.quantity for c in deck.cards), len(deck.cards)),
+    )
+    deck_id = cursor.lastrowid
+    db.executemany(
+        """INSERT INTO cards
+        (deck_id, deck_code, card_name, card_number, quantity, site, event,
+         placement, weight, image_ref)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        [(deck_id, deck.code, c.name, c.card_number, c.quantity, deck.site,
+          event, placement, weight, c.image_ref) for c in deck.cards],
+    )
+    db.commit()
 
 
 # --------------------------------------------------------------------------
 # Query
 # --------------------------------------------------------------------------
 
-def query_common_cards(wb: Workbook, top: int | None = None, weighted: bool = True):
-    """Aggregate the Cards sheet: for each distinct card name, how many
-    copies appear across all decks (optionally weighted by each deck's
-    placement weight), and in how many distinct decks it shows up."""
-    ws = wb[CARDS_SHEET]
-    totals: dict[str, dict] = {}
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        deck_code, name, card_number, qty, site, event, placement, weight, image_ref = row
-        if not name:
-            continue
-        bucket = totals.setdefault(name, {"card_number": card_number or "", "score": 0.0, "raw_copies": 0, "decks": set()})
-        w = weight if (weighted and weight is not None) else 1
-        bucket["score"] += (qty or 0) * w
-        bucket["raw_copies"] += qty or 0
-        bucket["decks"].add(deck_code)
-        if card_number and not bucket["card_number"]:
-            bucket["card_number"] = card_number
-
-    rows = [
-        {
-            "name": name,
-            "card_number": b["card_number"],
-            "score": round(b["score"], 2),
-            "raw_copies": b["raw_copies"],
-            "deck_count": len(b["decks"]),
-        }
-        for name, b in totals.items()
-    ]
-    rows.sort(key=lambda r: r["score"], reverse=True)
-    return rows[:top] if top else rows
+def query_common_cards(
+    db: sqlite3.Connection,
+    top: int | None = None,
+    weighted: bool = True,
+    event: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    nation: str = "",
+):
+    """Aggregate cards directly in SQLite for fast report generation."""
+    score = "SUM(quantity * weight)" if weighted else "SUM(quantity)"
+    limit_sql = " LIMIT ?" if top else ""
+    filters = ["cards.card_name <> ''", "lower(cards.card_name) <> lower('Energy Generator')"]
+    params: list = []
+    if event.strip():
+        filters.append("lower(decks.event) LIKE lower(?)")
+        params.append(f"%{event.strip()}%")
+    if date_from.strip():
+        filters.append("substr(decks.date_added, 1, 10) >= ?")
+        params.append(date_from.strip())
+    if date_to.strip():
+        filters.append("substr(decks.date_added, 1, 10) <= ?")
+        params.append(date_to.strip())
+    if nation.strip() and nation.strip().lower() != "all nations":
+        filters.append("lower(decks.nation) = lower(?)")
+        params.append(nation.strip())
+    if top:
+        params.append(top)
+    rows = db.execute(
+        f"""SELECT card_name AS name,
+                   COALESCE(MIN(NULLIF(card_number, '')), '') AS card_number,
+                   COALESCE(MIN(NULLIF(image_ref, '')), '') AS image_ref,
+                   ROUND({score}, 2) AS score,
+                   SUM(quantity) AS raw_copies,
+                   COUNT(DISTINCT cards.deck_code) AS deck_count
+            FROM cards
+            JOIN decks ON decks.id = cards.deck_id
+            WHERE {' AND '.join(filters)}
+            GROUP BY card_name
+            ORDER BY score DESC{limit_sql}""",
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def print_report(rows, weighted: bool) -> None:
@@ -512,10 +608,10 @@ def prompt(text: str, default: str = "") -> str:
 
 
 def interactive_loop(wb_path: Path, debug: bool) -> None:
-    wb = open_or_create_workbook(wb_path)
+    db = open_database(wb_path)
     debug_dir = wb_path.parent / "debug" if debug else None
 
-    print(f"Using workbook: {wb_path.resolve()}")
+    print(f"Using database: {wb_path.resolve()}")
     print("Enter a Deck Log code to add it. Leave the code blank to stop.\n")
 
     while True:
@@ -547,13 +643,13 @@ def interactive_loop(wb_path: Path, debug: bool) -> None:
         if event:
             placement = prompt("  Placement (e.g. 1st, Top4, Top8; blank = Unknown)")
 
-        save_deck(wb, deck, event, placement)
-        wb.save(wb_path)
-        print(f"  Saved. Workbook now has {wb[DECKS_SHEET].max_row - 1} deck(s).\n")
+        save_deck(db, deck, event, placement)
+        deck_count = db.execute("SELECT COUNT(*) FROM decks").fetchone()[0]
+        print(f"  Saved. Database now has {deck_count} deck(s).\n")
 
-    if wb[DECKS_SHEET].max_row > 1:
+    if db.execute("SELECT EXISTS(SELECT 1 FROM decks)").fetchone()[0]:
         if input("Run the common-cards report now? [Y/n]: ").strip().lower() != "n":
-            rows = query_common_cards(wb, top=25, weighted=True)
+            rows = query_common_cards(db, top=25, weighted=True)
             print()
             print_report(rows, weighted=True)
 
@@ -561,9 +657,9 @@ def interactive_loop(wb_path: Path, debug: bool) -> None:
 
 
 def cmd_add(args: argparse.Namespace) -> None:
-    wb_path = Path(args.file)
-    wb = open_or_create_workbook(wb_path)
-    debug_dir = wb_path.parent / "debug" if args.debug else None
+    db_path = Path(args.file)
+    db = open_database(db_path)
+    debug_dir = db_path.parent / "debug" if args.debug else None
 
     site = args.site.upper() if args.site else ""
     while site not in ("EN", "JP"):
@@ -573,28 +669,27 @@ def cmd_add(args: argparse.Namespace) -> None:
     deck = fetch_decklist(args.code, site, debug_dir=debug_dir)
     print(f"Found {len(deck.cards)} unique cards ({sum(c.quantity for c in deck.cards)} total).")
 
-    save_deck(wb, deck, args.event or "", args.placement or "")
-    wb.save(wb_path)
-    print(f"Saved to {wb_path.resolve()}")
+    save_deck(db, deck, args.event or "", args.placement or "")
+    print(f"Saved to {db_path.resolve()}")
 
 
 def cmd_query(args: argparse.Namespace) -> None:
-    wb_path = Path(args.file)
-    if not wb_path.exists():
-        print(f"No workbook found at {wb_path}. Add some decks first.")
+    db_path = Path(args.file)
+    if not db_path.exists():
+        print(f"No database found at {db_path}. Add some decks first.")
         return
-    wb = load_workbook(wb_path)
-    rows = query_common_cards(wb, top=args.top, weighted=not args.unweighted)
+    db = open_database(db_path)
+    rows = query_common_cards(db, top=args.top, weighted=not args.unweighted)
     print_report(rows, weighted=not args.unweighted)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--file", default=DEFAULT_WORKBOOK, help=f"Excel workbook path (default: {DEFAULT_WORKBOOK})")
+    parser.add_argument("--file", default=DEFAULT_DATABASE, help=f"SQLite database path (default: {DEFAULT_DATABASE})")
     parser.add_argument("--debug", action="store_true", help="Save page HTML + screenshot on fetch for troubleshooting")
     sub = parser.add_subparsers(dest="command")
 
-    p_add = sub.add_parser("add", help="Fetch one deck by code and add/update it in the workbook")
+    p_add = sub.add_parser("add", help="Fetch one deck by code and add/update it in the database")
     p_add.add_argument("code")
     p_add.add_argument("--site", choices=["EN", "en", "JP", "jp"], help="Which Deck Log site the code is from")
     p_add.add_argument("--event", help="Tournament / event name")
