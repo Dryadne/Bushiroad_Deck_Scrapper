@@ -8,15 +8,11 @@ the English site (decklog-en.bushiroad.com) or the Japanese site
 be queried for card frequency across many decks -- optionally weighted by
 tournament placement.
 
-WHY A HEADLESS BROWSER, NOT `requests`:
-Deck Log's /view/<code> pages are rendered client-side (the raw HTML is
-just a JS app shell). Bushiroad has not published a documented JSON
-endpoint for "give me the deck for this code" (only an unrelated card
-*search* endpoint). The reliable way to get the card list -- the same way
-existing community tools do it (a Cardmarket-export bookmarklet, a
-Firefox deck-exporter extension) -- is to render the page in a real
-browser and read the card tiles out of the DOM. This script uses
-Playwright (headless Chromium) for that.
+HOW DECKS ARE FETCHED:
+Deck Log's undocumented JSON endpoint is tried first, which returns the main
+deck, G/Extra Deck, and ride line directly. If that endpoint is unavailable,
+the script falls back to rendering the page in a real browser and reading the
+card tiles from the DOM with Playwright (headless Chromium).
 
 SETUP
 -----
@@ -54,9 +50,13 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import re
 import sqlite3
 import sys
+import unicodedata
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -99,6 +99,9 @@ class CardEntry:
     quantity: int
     card_number: str = ""
     image_ref: str = ""
+    section: str = "main"
+    canonical_number: str = ""
+    language: str = ""
 
 
 @dataclass
@@ -110,6 +113,9 @@ class DeckResult:
     deck_title: str = ""
     nation: str = ""
     regulation: str = ""
+    archetype: str = ""
+    archetype_card_number: str = ""
+    ride_line: list[CardEntry] = field(default_factory=list)
     cards: list[CardEntry] = field(default_factory=list)
 
 
@@ -124,6 +130,43 @@ class TournamentEntry:
 
 SUPPORTED_GAMES = ("Cardfight Vanguard", "Weiss Schwarz")
 
+API_GAME_TITLES = {
+    1: "Cardfight Vanguard",
+    2: "Weiss Schwarz",
+    101: "Cardfight Vanguard",
+}
+
+NATION_ALIASES = {
+    "ketersanctuary": "Keter Sanctuary",
+    "ケテルサンクチュアリ": "Keter Sanctuary",
+    "darkstates": "Dark States",
+    "ダークステイツ": "Dark States",
+    "dragonempire": "Dragon Empire",
+    "ドラゴンエンパイア": "Dragon Empire",
+    "brandtgate": "Brandt Gate",
+    "ブラントゲート": "Brandt Gate",
+    "stoicheia": "Stoicheia",
+    "ストイケイア": "Stoicheia",
+    "lyricalmonasterio": "Lyrical Monasterio",
+    "リリカルモナステリオ": "Lyrical Monasterio",
+    "toukenranbu": "Touken Ranbu",
+    "刀剣乱舞": "Touken Ranbu",
+    "recordofragnarok": "Record of Ragnarok",
+    "終末のワルキューレ": "Record of Ragnarok",
+    "bangdream": "BanG Dream!",
+    "バンドリ": "BanG Dream!",
+    "cocoro": "CoroCoro",
+    "コロコロ": "CoroCoro",
+    "buddyfight": "Buddyfight",
+    "バディファイト": "Buddyfight",
+}
+
+CARD_SET_ALIASES = {
+    "JP": {
+        "DZ-SS14": "DZ-SS13",
+    },
+}
+
 
 # Selector used by Deck Log's card tiles. This is the same selector the
 # christopherkade/cfv-deck-exporter tool and Cardmarket bookmarklet rely on
@@ -137,9 +180,139 @@ CARD_TILE_SELECTORS = [
 ]
 
 
+def normalize_card_number(card_number: str) -> str:
+    """Normalize only known language suffixes, preserving print variants."""
+    value = unicodedata.normalize("NFKC", card_number or "").strip().upper()
+    value = re.sub(r"\s+", "", value)
+    return re.sub(r"(?<=\d)(?:EN|JP)(?=-|$)", "", value)
+
+
+def canonical_card_number(card_number: str, site: str = "") -> str:
+    value = normalize_card_number(card_number)
+    if "/" not in value:
+        return value
+    set_code, card_index = value.split("/", 1)
+    set_code = CARD_SET_ALIASES.get(site.upper(), {}).get(set_code, set_code)
+    return f"{set_code}/{card_index}"
+
+
+def detect_card_language(card_number: str, name: str, site: str) -> str:
+    value = unicodedata.normalize("NFKC", f"{card_number} {name}")
+    if re.search(r"EN(?=-|$)", card_number.upper()):
+        return "EN"
+    if re.search(r"JP(?=-|$)", card_number.upper()) or re.search(r"[\u3040-\u30ff\u3400-\u9fff]", value):
+        return "JP"
+    return site.upper()
+
+
+def normalize_nation(nation: str) -> str:
+    value = unicodedata.normalize("NFKC", nation or "").strip()
+    key = re.sub(r"[^\w]+", "", value.casefold(), flags=re.UNICODE)
+    return NATION_ALIASES.get(key, value)
+
+
+def resolve_card_image(image_ref: str, site: str, game_title: str = "") -> str:
+    value = (image_ref or "").strip()
+    if not value:
+        return value
+    if "/system/app/img/" in value:
+        value = value.split("/system/app/img/", 1)[1]
+    if value.lower().startswith(("http://", "https://")):
+        return value
+    if game_title.strip().lower() == "cardfight vanguard":
+        host = "en.cf-vanguard.com" if site.upper() == "EN" else "cf-vanguard.com"
+        return f"https://{host}/wordpress/wp-content/images/cardlist/{value.lstrip('/')}"
+    host = "decklog-en.bushiroad.com" if site.upper() == "EN" else "decklog.bushiroad.com"
+    return f"https://{host}/system/app/img/{value.lstrip('/')}"
+
+
+def _fetch_decklist_api(code: str, site: str) -> DeckResult | None:
+    """Fetch a deck from Deck Log's JSON endpoint when available."""
+    host = "decklog-en.bushiroad.com" if site == "EN" else "decklog.bushiroad.com"
+    page_url = f"https://{host}/view/{code}"
+    api_paths = ["system/app/api/view"]
+    if site == "EN":
+        api_paths.append("system/app-ja/api/view")
+    else:
+        api_paths.append("system/app/api/view")
+    payload = None
+    for api_path in api_paths:
+        request = urllib.request.Request(
+            f"https://{host}/{api_path}/{code}",
+            data=b"null",
+            method="POST",
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "Content-Type": "application/json",
+                "Referer": page_url,
+                "User-Agent": "Mozilla/5.0",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                candidate = json.load(response)
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+            continue
+        if candidate.get("list") or candidate.get("sub_list") or candidate.get("p_list"):
+            payload = candidate
+            break
+    if payload is None:
+        return None
+
+    game_title = API_GAME_TITLES.get(payload.get("game_title_id"), "")
+
+    def parse_cards(items, section: str) -> list[CardEntry]:
+        cards = []
+        for item in items or []:
+            name = str(item.get("name") or "Unknown Card")
+            card_number = str(item.get("card_number") or "")
+            language = detect_card_language(card_number, name, site)
+            cards.append(CardEntry(
+                name=name,
+                quantity=int(item.get("num") or 1),
+                card_number=card_number,
+                image_ref=resolve_card_image(str(item.get("img") or ""), site, game_title),
+                section=section,
+                canonical_number=canonical_card_number(card_number, language),
+                language=language,
+            ))
+        return cards
+
+    main_cards = parse_cards(payload.get("list"), "main")
+    extra_cards = parse_cards(payload.get("sub_list"), "extra")
+    ride_line = parse_cards(payload.get("p_list"), "ride")
+    cards = main_cards + extra_cards
+    if not cards:
+        return None
+
+    archetype = ""
+    archetype_card_number = ""
+    for item in payload.get("p_list") or []:
+        if str(item.get("slot") or "").lower() == "grade_3" or str(item.get("grade") or "") == "3":
+            archetype = str(item.get("name") or "")
+            archetype_card_number = canonical_card_number(str(item.get("card_number") or ""), site)
+            break
+    return DeckResult(
+        code=code,
+        site=site,
+        url=page_url,
+        game_title=game_title,
+        deck_title=str(payload.get("title") or ""),
+        nation=normalize_nation(str(payload.get("deck_param2") or "")),
+        archetype=archetype,
+        archetype_card_number=archetype_card_number,
+        ride_line=ride_line,
+        cards=cards,
+    )
+
+
 def normalize_deck_title(title: str) -> str:
     title = re.sub(r"\s+deck$", "", (title or "").strip(), flags=re.IGNORECASE).strip()
     return re.sub(r"^Deck Name\s*\[([^]]*)\]$", r"\1", title, flags=re.IGNORECASE).strip()
+
+
+def normalize_deck_code(code: str) -> str:
+    return (code or "").strip().upper()
 
 
 def infer_game_from_cards(cards: list[CardEntry]) -> str:
@@ -157,9 +330,14 @@ def fetch_decklist(code: str, site: str, debug_dir: Path | None = None, headless
 
     site must be "EN" or "JP".
     """
+    code = normalize_deck_code(code)
     site = site.upper()
     if site not in SITE_URLS:
         raise ValueError(f"site must be one of {list(SITE_URLS)}, got {site!r}")
+
+    api_deck = _fetch_decklist_api(code, site)
+    if api_deck is not None:
+        return api_deck
 
     url = SITE_URLS[site].format(code=code)
     last_error: Exception | None = None
@@ -309,13 +487,13 @@ def fetch_tournament_entries(url: str, headless: bool = True) -> list[Tournament
                 links = row.locator("a[href]")
                 for link_index in range(links.count()):
                     href = (links.nth(link_index).get_attribute("href") or "").strip()
-                    match = re.search(r"decklog(?:-en)?\.bushiroad\.com/view/([^/?#]+)", href, flags=re.IGNORECASE)
+                    match = re.search(r"decklog(?:-en)?\.bushiroad\.com/(?:ja/)?view/([^/?#]+)", href, flags=re.IGNORECASE)
                     if not match:
                         continue
                     site = "EN" if "decklog-en" in href.lower() else "JP"
                     entries.append(TournamentEntry(
                         rank=rank or "Unknown",
-                        deck_code=match.group(1),
+                        deck_code=normalize_deck_code(match.group(1)),
                         site=site,
                         deck_url=href,
                         player_or_team=player_or_team,
@@ -428,6 +606,8 @@ def open_database(path: Path) -> sqlite3.Connection:
             site TEXT NOT NULL,
             game TEXT NOT NULL DEFAULT '',
             deck_title TEXT NOT NULL DEFAULT '',
+            archetype TEXT NOT NULL DEFAULT '',
+            archetype_card_number TEXT NOT NULL DEFAULT '',
             nation TEXT NOT NULL DEFAULT '',
             regulation TEXT NOT NULL DEFAULT '',
             date_added TEXT NOT NULL,
@@ -445,7 +625,10 @@ def open_database(path: Path) -> sqlite3.Connection:
             deck_code TEXT NOT NULL,
             card_name TEXT NOT NULL,
             card_number TEXT NOT NULL DEFAULT '',
+            canonical_card_number TEXT NOT NULL DEFAULT '',
             quantity INTEGER NOT NULL,
+            section TEXT NOT NULL DEFAULT 'main',
+            language TEXT NOT NULL DEFAULT '',
             site TEXT NOT NULL,
             event TEXT NOT NULL DEFAULT '',
             placement TEXT NOT NULL DEFAULT '',
@@ -463,6 +646,29 @@ def open_database(path: Path) -> sqlite3.Connection:
     deck_columns = {row[1] for row in db.execute("PRAGMA table_info(decks)")}
     if "tournament_date" not in deck_columns:
         db.execute("ALTER TABLE decks ADD COLUMN tournament_date TEXT NOT NULL DEFAULT ''")
+    if "archetype" not in deck_columns:
+        db.execute("ALTER TABLE decks ADD COLUMN archetype TEXT NOT NULL DEFAULT ''")
+    if "archetype_card_number" not in deck_columns:
+        db.execute("ALTER TABLE decks ADD COLUMN archetype_card_number TEXT NOT NULL DEFAULT ''")
+    card_columns = {row[1] for row in db.execute("PRAGMA table_info(cards)")}
+    if "canonical_card_number" not in card_columns:
+        db.execute("ALTER TABLE cards ADD COLUMN canonical_card_number TEXT NOT NULL DEFAULT ''")
+    if "section" not in card_columns:
+        db.execute("ALTER TABLE cards ADD COLUMN section TEXT NOT NULL DEFAULT 'main'")
+    if "language" not in card_columns:
+        db.execute("ALTER TABLE cards ADD COLUMN language TEXT NOT NULL DEFAULT ''")
+    db.execute("CREATE INDEX IF NOT EXISTS cards_canonical_number_idx ON cards(canonical_card_number)")
+    db.execute("CREATE INDEX IF NOT EXISTS decks_archetype_number_idx ON decks(archetype_card_number)")
+    for row in db.execute(
+        """SELECT cards.id, cards.card_number, cards.card_name, cards.site, cards.image_ref, decks.game
+           FROM cards JOIN decks ON decks.id = cards.deck_id"""
+    ).fetchall():
+        language = detect_card_language(row[1], row[2], row[3] or "")
+        db.execute(
+            "UPDATE cards SET canonical_card_number = ?, language = ?, image_ref = ? WHERE id = ?",
+            (canonical_card_number(row[1], language), language, resolve_card_image(row[4], row[3] or "", row[5] or ""), row[0]),
+        )
+    db.execute("CREATE INDEX IF NOT EXISTS cards_section_idx ON cards(section)")
     db.execute("CREATE INDEX IF NOT EXISTS decks_tournament_date_idx ON decks(tournament_date)")
     db.executemany(
         "INSERT OR IGNORE INTO placement_weights (placement, weight) VALUES (?, ?)",
@@ -506,33 +712,66 @@ def save_deck(
     placement: str,
     tournament_date: str = "",
 ) -> None:
+    deck.code = normalize_deck_code(deck.code)
     event = event or ""
     placement = placement or ""
     tournament_date = (tournament_date or "").strip()
+    existing = db.execute(
+        "SELECT event, placement, tournament_date FROM decks WHERE deck_code = ? AND site = ?",
+        (deck.code, deck.site),
+    ).fetchone()
+    if existing is not None:
+        event = event.strip() or existing["event"]
+        placement = placement.strip() or existing["placement"]
+        tournament_date = tournament_date or existing["tournament_date"]
     if tournament_date:
         try:
             dt.date.fromisoformat(tournament_date)
         except ValueError as exc:
             raise ValueError("tournament date must use YYYY-MM-DD format") from exc
     weight = get_placement_weight(db, placement) if placement else 1.0
+    all_cards = deck.cards + deck.ride_line
+    archetype_card_number = canonical_card_number(deck.archetype_card_number, deck.site)
+    archetype = deck.archetype
+    if archetype_card_number:
+        english_name = db.execute(
+            """SELECT card_name FROM cards
+               WHERE canonical_card_number = ? AND language = 'EN'
+                 AND card_name <> '' ORDER BY id LIMIT 1""",
+            (archetype_card_number,),
+        ).fetchone()
+        if english_name is not None:
+            archetype = english_name[0]
+        else:
+            existing_name = db.execute(
+                """SELECT archetype FROM decks
+                   WHERE archetype_card_number = ? AND archetype <> ''
+                   ORDER BY CASE WHEN site = 'EN' THEN 0 ELSE 1 END, id LIMIT 1""",
+                (archetype_card_number,),
+            ).fetchone()
+            if existing_name is not None:
+                archetype = existing_name[0]
     db.execute("DELETE FROM decks WHERE deck_code = ? AND site = ?", (deck.code, deck.site))
     cursor = db.execute(
         """INSERT INTO decks
-        (deck_code, site, game, deck_title, nation, regulation, date_added,
+        (deck_code, site, game, deck_title, archetype, archetype_card_number, nation, regulation, date_added,
          tournament_date, deck_url, event, placement, total_cards, unique_cards)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (deck.code, deck.site, deck.game_title, deck.deck_title, deck.nation,
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (deck.code, deck.site, deck.game_title, deck.deck_title, archetype, archetype_card_number, deck.nation,
          deck.regulation, dt.datetime.now().isoformat(timespec="seconds"),
-         tournament_date, deck.url, event, placement, sum(c.quantity for c in deck.cards), len(deck.cards)),
+         tournament_date, deck.url, event, placement, sum(c.quantity for c in all_cards), len(all_cards)),
     )
     deck_id = cursor.lastrowid
     db.executemany(
         """INSERT INTO cards
-        (deck_id, deck_code, card_name, card_number, quantity, site, event,
+                (deck_id, deck_code, card_name, card_number, canonical_card_number, quantity, section, language, site, event,
          placement, weight, image_ref)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        [(deck_id, deck.code, c.name, c.card_number, c.quantity, deck.site,
-          event, placement, weight, c.image_ref) for c in deck.cards],
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [(deck_id, deck.code, c.name, c.card_number,
+                      c.canonical_number or canonical_card_number(c.card_number, deck.site), c.quantity,
+                      c.section, c.language or deck.site, deck.site, event, placement, weight,
+                      resolve_card_image(c.image_ref, deck.site, deck.game_title))
+                 for c in all_cards],
     )
     db.commit()
 
@@ -549,11 +788,16 @@ def query_common_cards(
     date_from: str = "",
     date_to: str = "",
     nation: str = "",
+    archetype: str = "",
 ):
     """Aggregate cards directly in SQLite for fast report generation."""
     score = "SUM(quantity * weight)" if weighted else "SUM(quantity)"
     limit_sql = " LIMIT ?" if top else ""
-    filters = ["cards.card_name <> ''", "lower(cards.card_name) <> lower('Energy Generator')"]
+    filters = [
+        "cards.card_name <> ''",
+        "lower(cards.card_name) <> lower('Energy Generator')",
+        "cards.section IN ('main', 'extra')",
+    ]
     params: list = []
     if event.strip():
         filters.append("lower(decks.event) LIKE lower(?)")
@@ -567,19 +811,37 @@ def query_common_cards(
     if nation.strip() and nation.strip().lower() != "all nations":
         filters.append("lower(decks.nation) = lower(?)")
         params.append(nation.strip())
+    if archetype.strip() and archetype.strip().lower() != "all archetypes":
+        filters.append("lower(decks.archetype) = lower(?)")
+        params.append(archetype.strip())
+    group_key = "COALESCE(NULLIF(cards.canonical_card_number, ''), NULLIF(cards.card_number, ''), 'name:' || lower(cards.card_name))"
     if top:
         params.append(top)
     rows = db.execute(
-        f"""SELECT card_name AS name,
-                   COALESCE(MIN(NULLIF(card_number, '')), '') AS card_number,
-                   COALESCE(MIN(NULLIF(image_ref, '')), '') AS image_ref,
+                f"""SELECT COALESCE(
+                                             (SELECT english.card_name FROM cards AS english
+                                                WHERE english.language = 'EN'
+                                                    AND english.card_name <> ''
+                                                    AND COALESCE(NULLIF(english.canonical_card_number, ''), NULLIF(english.card_number, '')) = {group_key}
+                                                ORDER BY english.id LIMIT 1),
+                                             MIN(cards.card_name)
+                                     ) AS name,
+                                     COALESCE(MIN(NULLIF(cards.canonical_card_number, '')), MIN(NULLIF(cards.card_number, '')), '') AS card_number,
+                                     COALESCE(
+                                             (SELECT english.image_ref FROM cards AS english
+                                                WHERE english.language = 'EN'
+                                                    AND english.image_ref <> ''
+                                                    AND COALESCE(NULLIF(english.canonical_card_number, ''), NULLIF(english.card_number, '')) = {group_key}
+                                                ORDER BY english.id LIMIT 1),
+                                             MIN(NULLIF(cards.image_ref, '')), ''
+                                     ) AS image_ref,
                    ROUND({score}, 2) AS score,
-                   SUM(quantity) AS raw_copies,
-                   COUNT(DISTINCT cards.deck_code) AS deck_count
-            FROM cards
-            JOIN decks ON decks.id = cards.deck_id
+                                     SUM(cards.quantity) AS raw_copies,
+                                     COUNT(DISTINCT cards.deck_code) AS deck_count
+                        FROM cards
+                        JOIN decks ON decks.id = cards.deck_id
             WHERE {' AND '.join(filters)}
-            GROUP BY card_name
+                        GROUP BY {group_key}
             ORDER BY score DESC{limit_sql}""",
         params,
     ).fetchall()

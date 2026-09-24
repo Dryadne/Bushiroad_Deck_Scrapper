@@ -122,7 +122,9 @@ class DeckLogApp(tk.Tk):
         self.filter_date_from = tk.StringVar()
         self.filter_date_to = tk.StringVar()
         self.filter_nation = tk.StringVar(value="All nations")
+        self.filter_archetype = tk.StringVar(value="All archetypes")
         self.nation_box: ttk.Combobox | None = None
+        self.archetype_box: ttk.Combobox | None = None
         self.jobs: queue.Queue = queue.Queue()
 
         self._setup_styles()
@@ -191,9 +193,13 @@ class DeckLogApp(tk.Tk):
         body = ttk.Frame(self, padding=(24, 0, 24, 16))
         body.pack(fill="both", expand=True)
 
-        import_panel = ttk.Frame(body, style="Panel.TFrame", padding=14)
-        import_panel.pack(side="left", fill="x", anchor="n", padx=(0, 14))
-        import_tabs = ttk.Notebook(import_panel, width=260)
+        body_pane = ttk.Panedwindow(body, orient="horizontal")
+        body_pane.pack(fill="both", expand=True)
+
+        import_panel = ttk.Frame(body_pane, style="Panel.TFrame", padding=14, width=340)
+        import_panel.pack_propagate(False)
+        body_pane.add(import_panel, weight=0)
+        import_tabs = ttk.Notebook(import_panel, width=340)
         import_tabs.pack(fill="x")
         deck_page = ttk.Frame(import_tabs, style="Panel.TFrame", padding=(2, 8, 2, 0))
         tournament_page = ttk.Frame(import_tabs, style="Panel.TFrame", padding=(2, 8, 2, 0))
@@ -201,7 +207,7 @@ class DeckLogApp(tk.Tk):
         import_tabs.add(tournament_page, text=" Tournament ")
 
         ttk.Label(deck_page, text="Import a deck", style="Section.TLabel").pack(anchor="w")
-        ttk.Label(deck_page, text="Paste a Deck Log code to fetch or update it.", style="Muted.TLabel", wraplength=245).pack(anchor="w", pady=(2, 12))
+        ttk.Label(deck_page, text="Paste a Deck Log code to fetch or update it.", style="Muted.TLabel", wraplength=315).pack(anchor="w", pady=(2, 12))
         self._field(deck_page, "DECK CODE", self.code, "e.g. 53V7L")
         ttk.Label(deck_page, text="SITE", style="Muted.TLabel").pack(anchor="w", pady=(14, 5))
         site_row = ttk.Frame(deck_page, style="Panel.TFrame")
@@ -214,19 +220,19 @@ class DeckLogApp(tk.Tk):
         ttk.Checkbutton(deck_page, text="Save debug HTML + screenshot", variable=self.debug).pack(anchor="w", pady=(16, 0))
         self.import_button = ttk.Button(deck_page, text="Fetch and save deck", style="Accent.TButton", command=self.import_deck)
         self.import_button.pack(fill="x", pady=(20, 0))
-        ttk.Label(deck_page, text="Re-importing the same code updates it in place.", style="Muted.TLabel", wraplength=235).pack(anchor="w", pady=(10, 0))
+        ttk.Label(deck_page, text="Re-importing the same code updates it in place.", style="Muted.TLabel", wraplength=305).pack(anchor="w", pady=(10, 0))
 
         ttk.Label(tournament_page, text="Import a tournament", style="Section.TLabel").pack(anchor="w")
-        ttk.Label(tournament_page, text="Load every ranked Deck Log link from a results page.", style="Muted.TLabel", wraplength=245).pack(anchor="w", pady=(2, 12))
+        ttk.Label(tournament_page, text="Load every ranked Deck Log link from a results page.", style="Muted.TLabel", wraplength=315).pack(anchor="w", pady=(2, 12))
         self._field(tournament_page, "TOURNAMENT PAGE URL", self.tournament_url, "paste the results page URL")
         self._field(tournament_page, "EVENT / TOURNAMENT", self.tournament_event, "applied to every imported deck")
         self._date_field(tournament_page, "TOURNAMENT DATE", self.tournament_date, "optional")
         self.tournament_button = ttk.Button(tournament_page, text="Import entire tournament", style="Accent.TButton", command=self.import_tournament)
         self.tournament_button.pack(fill="x", pady=(18, 0))
-        ttk.Label(tournament_page, text="The page rank is saved as the placement for each imported deck.", style="Muted.TLabel", wraplength=245).pack(anchor="w", pady=(10, 0))
+        ttk.Label(tournament_page, text="The page rank is saved as the placement for each imported deck.", style="Muted.TLabel", wraplength=315).pack(anchor="w", pady=(10, 0))
 
-        right = ttk.Frame(body)
-        right.pack(side="left", fill="both", expand=True)
+        right = ttk.Frame(body_pane)
+        body_pane.add(right, weight=1)
         metrics = ttk.Frame(right, style="Panel.TFrame", padding=(18, 13))
         metrics.pack(fill="x", pady=(0, 12))
         self._metric(metrics, "DECKS", self.deck_count).pack(side="left", padx=(0, 45))
@@ -234,17 +240,25 @@ class DeckLogApp(tk.Tk):
 
         filters = ttk.Frame(right, style="Panel.TFrame", padding=(10, 7))
         filters.pack(fill="x", pady=(0, 12))
-        ttk.Label(filters, text="FILTER", style="Muted.TLabel").pack(side="left", padx=(0, 8))
-        ttk.Entry(filters, textvariable=self.filter_event, width=20).pack(side="left")
-        ttk.Label(filters, text="Tournament", style="Muted.TLabel").pack(side="left", padx=(5, 14))
-        self._date_filter(filters, self.filter_date_from)
-        ttk.Label(filters, text="to", style="Muted.TLabel").pack(side="left", padx=5)
-        self._date_filter(filters, self.filter_date_to)
-        ttk.Label(filters, text="NATION", style="Muted.TLabel").pack(side="left", padx=(12, 5))
-        self.nation_box = ttk.Combobox(filters, textvariable=self.filter_nation, values=("All nations",), state="readonly", width=16)
+        filter_row = ttk.Frame(filters, style="Panel.TFrame")
+        filter_row.pack(fill="x", pady=(0, 6))
+        ttk.Label(filter_row, text="FILTER", style="Muted.TLabel").pack(side="left", padx=(0, 8))
+        ttk.Entry(filter_row, textvariable=self.filter_event).pack(side="left", fill="x", expand=True)
+        ttk.Label(filter_row, text="Tournament", style="Muted.TLabel").pack(side="left", padx=(10, 8))
+        self._date_filter(filter_row, self.filter_date_from)
+        ttk.Label(filter_row, text="to", style="Muted.TLabel").pack(side="left", padx=5)
+        self._date_filter(filter_row, self.filter_date_to)
+
+        filter_row_two = ttk.Frame(filters, style="Panel.TFrame")
+        filter_row_two.pack(fill="x")
+        ttk.Label(filter_row_two, text="NATION", style="Muted.TLabel").pack(side="left", padx=(0, 5))
+        self.nation_box = ttk.Combobox(filter_row_two, textvariable=self.filter_nation, values=("All nations",), state="readonly", width=16)
         self.nation_box.pack(side="left")
-        ttk.Button(filters, text="Apply", command=self.refresh_views).pack(side="left")
-        ttk.Button(filters, text="Clear", command=self.clear_filters).pack(side="left", padx=(6, 0))
+        ttk.Label(filter_row_two, text="ARCHETYPE", style="Muted.TLabel").pack(side="left", padx=(12, 5))
+        self.archetype_box = ttk.Combobox(filter_row_two, textvariable=self.filter_archetype, values=("All archetypes",), state="readonly", width=24)
+        self.archetype_box.pack(side="left", fill="x", expand=True)
+        ttk.Button(filter_row_two, text="Apply", command=self.refresh_views).pack(side="left", padx=(8, 0))
+        ttk.Button(filter_row_two, text="Clear", command=self.clear_filters).pack(side="left", padx=(6, 0))
 
         tabs = ttk.Notebook(right)
         tabs.pack(fill="both", expand=True)
@@ -262,11 +276,11 @@ class DeckLogApp(tk.Tk):
         ttk.Label(footer, textvariable=self.status, style="Muted.TLabel").pack(side="left", padx=(10, 0))
 
     def _build_decks_tab(self, parent: ttk.Frame) -> None:
-        columns = ("code", "site", "game", "title", "nation", "event", "tournament_date", "placement", "cards")
+        columns = ("code", "site", "game", "title", "archetype", "nation", "event", "tournament_date", "placement", "cards")
         self.decks_tree = ttk.Treeview(parent, columns=columns, show="headings")
         self.decks_tree.bind("<Double-1>", self.open_selected_deck)
-        headings = {"code": "Code", "site": "Site", "game": "Game", "title": "Deck title", "nation": "Nation", "event": "Event", "tournament_date": "Tournament date", "placement": "Place", "cards": "Cards"}
-        widths = {"code": 85, "site": 45, "game": 125, "title": 155, "nation": 105, "event": 145, "tournament_date": 110, "placement": 75, "cards": 55}
+        headings = {"code": "Code", "site": "Site", "game": "Game", "title": "Deck title", "archetype": "Archetype", "nation": "Nation", "event": "Event", "tournament_date": "Tournament date", "placement": "Place", "cards": "Cards"}
+        widths = {"code": 85, "site": 45, "game": 125, "title": 155, "archetype": 190, "nation": 105, "event": 145, "tournament_date": 110, "placement": 75, "cards": 55}
         for column in columns:
             self.decks_tree.heading(column, text=headings[column])
             self.decks_tree.column(column, width=widths[column], anchor="w" if column == "code" else "center")
@@ -345,6 +359,7 @@ class DeckLogApp(tk.Tk):
         self.filter_event.set("")
         self.filter_date_from.set("")
         self.filter_date_to.set("")
+        self.filter_archetype.set("All archetypes")
         self.refresh_views()
 
     def import_deck(self) -> None:
@@ -474,15 +489,20 @@ class DeckLogApp(tk.Tk):
                 self.nation_box.configure(values=("All nations", *nations))
                 if self.filter_nation.get() not in ("All nations", *nations):
                     self.filter_nation.set("All nations")
+            archetypes = [row[0] for row in db.execute("SELECT DISTINCT archetype FROM decks WHERE archetype <> '' ORDER BY archetype").fetchall()]
+            if self.archetype_box is not None:
+                self.archetype_box.configure(values=("All archetypes", *archetypes))
+                if self.filter_archetype.get() not in ("All archetypes", *archetypes):
+                    self.filter_archetype.set("All archetypes")
             rows = db.execute(
-                f"""SELECT deck_code, site, game, deck_title, nation, event, tournament_date, placement, total_cards
+                f"""SELECT deck_code, site, game, deck_title, archetype, nation, event, tournament_date, placement, total_cards
                    FROM decks {filter_sql} ORDER BY id DESC""",
                 filter_params,
             ).fetchall()
             for row in rows:
                 code = row["deck_code"]
                 site = row["site"]
-                self.decks_tree.insert("", "end", iid=f"{site}:{code}", values=(code, site, row["game"], row["deck_title"], row["nation"], row["event"], row["tournament_date"], row["placement"], row["total_cards"]))
+                self.decks_tree.insert("", "end", iid=f"{site}:{code}", values=(code, site, row["game"], row["deck_title"], row["archetype"], row["nation"], row["event"], row["tournament_date"], row["placement"], row["total_cards"]))
             self.refresh_report()
             self.status.set(f"Opened {path.name}")
         except Exception as exc:
@@ -507,6 +527,7 @@ class DeckLogApp(tk.Tk):
                 date_from=self.filter_date_from.get(),
                 date_to=self.filter_date_to.get(),
                 nation=self.filter_nation.get(),
+                archetype=self.filter_archetype.get(),
             )
             for rank, row in enumerate(rows, start=1):
                 self.report_tree.insert("", "end", values=(rank, row["name"], row["card_number"], row["score"], row["raw_copies"], row["deck_count"]), tags=(row["image_ref"],))
@@ -522,6 +543,9 @@ class DeckLogApp(tk.Tk):
         if self.filter_nation.get().strip() and self.filter_nation.get() != "All nations":
             filters.append("AND lower(decks.nation) = lower(?)" if filters else "WHERE lower(decks.nation) = lower(?)")
             params.append(self.filter_nation.get().strip())
+        if self.filter_archetype.get().strip() and self.filter_archetype.get() != "All archetypes":
+            filters.append("AND lower(decks.archetype) = lower(?)" if filters else "WHERE lower(decks.archetype) = lower(?)")
+            params.append(self.filter_archetype.get().strip())
         if self.filter_date_from.get().strip():
             filters.append("AND substr(decks.date_added, 1, 10) >= ?" if filters else "WHERE substr(decks.date_added, 1, 10) >= ?")
             params.append(self.filter_date_from.get().strip())

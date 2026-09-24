@@ -84,17 +84,27 @@ python decklog_tracker.py --file my_decks.db query
 
 The SQLite database contains `decks`, `cards`, and `placement_weights` tables.
 Each deck keeps both its automatic import timestamp (`date_added`) and optional
-event date (`tournament_date`).
+event date (`tournament_date`) plus its grade-3 ride-line card as `archetype`.
+Card rows are marked as `main`, `extra`, or `ride`; deck totals include all
+three sections, while card reports aggregate only the main and G/Extra Deck.
+Cards also retain their original language and card number alongside a
+canonical card number. Only confirmed `EN`/`JP` language suffixes are removed;
+print variants remain distinct. This lets Japanese and English imports share
+card totals without merging unrelated prints, and English archetype names are
+used when the canonical grade-3 card is already known.
+Known cross-language set renumberings are handled explicitly; for example,
+Japanese `DZ-SS14` maps to English `DZ-SS13` while unrelated set numbers remain
+unchanged.
 Deck updates are unique by site and deck code, card reports use indexed SQL
 aggregation, and unknown placement labels are added with weight `1`.
 
-## If scraping comes back empty
+## If the API comes back empty
 
-Deck Log's pages are rendered client-side — there's no documented public
-API for "give me the deck for this code," so this script renders the page
-in a real (headless) browser and reads the card tiles out of the DOM,
-the same approach existing community tools (a Cardmarket export
-bookmarklet, a Firefox deck-exporter extension) use for the EN site.
+The importer tries Deck Log's undocumented JSON endpoint first. If it returns
+no card sections or is unavailable, the script falls back to rendering the
+page in a real (headless) browser and reads the card tiles out of the DOM.
+The API path is preferred because it preserves the ride line and G/Extra Deck
+sections and returns reliable card numbers, names, and quantities.
 
 If a fetch returns 0 cards — which can happen if Bushiroad tweaks their
 markup, or if the JP site's DOM turns out to differ from the EN site's —
@@ -112,10 +122,8 @@ one small, isolated function for exactly this reason.
 
 ## Notes / limitations
 
-- Card **number/set code** extraction is best-effort (parsed from the
-  card image filename) and may come back blank for some games — card
-  **name** and **quantity** are the reliable fields and are what the
-  report groups by.
+- API imports include card numbers, names, quantities, and section metadata.
+  Browser-fallback imports retain the older best-effort card number parsing.
 - Only decks that Deck Log will actually render for an anonymous visitor
   can be fetched (i.e. the same as opening the `/view/<code>` link
   yourself in a browser).
