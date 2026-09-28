@@ -19,6 +19,7 @@ from decklog_tracker import (
     query_common_cards,
     save_deck,
     fetch_tournament_entries,
+    match_japanese_cards,
 )
 
 
@@ -279,6 +280,12 @@ class DeckLogApp(tk.Tk):
         columns = ("code", "site", "game", "title", "archetype", "nation", "event", "tournament_date", "placement", "cards")
         self.decks_tree = ttk.Treeview(parent, columns=columns, show="headings")
         self.decks_tree.bind("<Double-1>", self.open_selected_deck)
+        self.decks_tree.bind("<Button-3>", self.show_deck_context_menu)
+        self.decks_context_menu = tk.Menu(self, tearoff=False)
+        self.decks_context_menu.add_command(label="Re-import from Deck Log", command=self.reimport_selected_deck)
+        self.decks_context_menu.add_command(label="View in browser", command=lambda: self.open_selected_deck(None))
+        self.decks_context_menu.add_separator()
+        self.decks_context_menu.add_command(label="Remove from database", command=self.delete_selected_deck)
         headings = {"code": "Code", "site": "Site", "game": "Game", "title": "Deck title", "archetype": "Archetype", "nation": "Nation", "event": "Event", "tournament_date": "Tournament date", "placement": "Place", "cards": "Cards"}
         widths = {"code": 85, "site": 45, "game": 125, "title": 155, "archetype": 190, "nation": 105, "event": 145, "tournament_date": 110, "placement": 75, "cards": 55}
         for column in columns:
@@ -298,6 +305,8 @@ class DeckLogApp(tk.Tk):
         top_box.pack(side="left")
         top_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh_report())
         ttk.Button(toolbar, text="Refresh report", command=self.refresh_report).pack(side="right")
+        self.wiki_match_button = ttk.Button(toolbar, text="Find JP matches", command=self.match_wiki_cards)
+        self.wiki_match_button.pack(side="right", padx=(0, 8))
 
         columns = ("rank", "name", "number", "score", "copies", "decks")
         self.report_tree = ttk.Treeview(parent, columns=columns, show="headings")
@@ -386,6 +395,21 @@ class DeckLogApp(tk.Tk):
         args = (url, self.tournament_event.get().strip(), self.tournament_date.get().strip(), self.debug.get(), self.database_path.get().strip())
         threading.Thread(target=self._import_tournament_worker, args=args, daemon=True).start()
 
+    def match_wiki_cards(self) -> None:
+        path = self.database_path.get().strip() or DEFAULT_DATABASE
+        self.wiki_match_button.configure(state="disabled")
+        self.progress.start(12)
+        self.status.set("Looking up Japanese card names and printings...")
+        threading.Thread(target=self._wiki_match_worker, args=(path,), daemon=True).start()
+
+    def _wiki_match_worker(self, database_name: str) -> None:
+        try:
+            db = open_database(Path(database_name))
+            attempted, matched, printings = match_japanese_cards(db)
+            self.jobs.put(("wiki_match", f"Wiki lookup complete: {attempted} cards checked, {matched} matched, {printings} printings indexed."))
+        except Exception as exc:
+            self.jobs.put(("wiki_match_error", str(exc)))
+
     def _import_worker(self, code: str, site: str, event: str, tournament_date: str, placement: str, debug: bool, database_name: str) -> None:
         try:
             fallback_path = Path(database_name or DEFAULT_DATABASE)
@@ -399,6 +423,19 @@ class DeckLogApp(tk.Tk):
         except Exception as exc:
             self.jobs.put(("error", str(exc)))
 
+    def _reimport_worker(self, code: str, site: str, source_url: str, database_name: str) -> None:
+        db = None
+        try:
+            deck = fetch_decklist(code, site, source_url=source_url)
+            db = open_database(Path(database_name or DEFAULT_DATABASE))
+            save_deck(db, deck, "", "", "")
+            self.jobs.put(("success", f"Re-import complete. Updated {code} in {Path(database_name).name}.", database_name))
+        except Exception as exc:
+            self.jobs.put(("error", str(exc)))
+        finally:
+            if db is not None:
+                db.close()
+
     def _import_tournament_worker(self, url: str, event: str, tournament_date: str, debug: bool, database_name: str) -> None:
         try:
             entries = fetch_tournament_entries(url)
@@ -411,7 +448,7 @@ class DeckLogApp(tk.Tk):
             for entry in entries:
                 try:
                     self.jobs.put(("progress", imported, len(entries), entry.deck_code))
-                    deck = fetch_decklist(entry.deck_code, entry.site)
+                    deck = fetch_decklist(entry.deck_code, entry.site, source_url=entry.deck_url)
                     path = self._database_path_for_game(deck.game_title, fallback_path)
                     db = open_database(path)
                     save_deck(db, deck, event, entry.rank, tournament_date)
@@ -437,6 +474,17 @@ class DeckLogApp(tk.Tk):
             while True:
                 message = self.jobs.get_nowait()
                 kind = message[0]
+                if kind in ("wiki_match", "wiki_match_error"):
+                    self.progress.stop()
+                    self.progress.configure(mode="determinate", maximum=1, value=1)
+                    self.wiki_match_button.configure(state="normal")
+                    if kind == "wiki_match":
+                        self.refresh_views()
+                        self.status.set(message[1])
+                    else:
+                        self.status.set("Wiki lookup failed")
+                        messagebox.showerror("Could not look up cards", message[1])
+                    continue
                 if kind == "progress_start":
                     self.progress.stop()
                     self.progress.configure(mode="determinate", maximum=message[1], value=0)
@@ -562,8 +610,85 @@ class DeckLogApp(tk.Tk):
         if len(values) < 2:
             return
         code, site = values[0], values[1]
+        source_url = self._deck_source_url(code, site)
+        if source_url:
+            webbrowser.open(source_url)
+            return
         host = "decklog-en.bushiroad.com" if site == "EN" else "decklog.bushiroad.com"
         webbrowser.open(f"https://{host}/view/{code}")
+
+    def _deck_source_url(self, code: str, site: str) -> str:
+        db = open_database(Path(self.database_path.get().strip() or DEFAULT_DATABASE))
+        try:
+            row = db.execute(
+                "SELECT deck_url FROM decks WHERE deck_code = ? AND site = ?",
+                (code, site),
+            ).fetchone()
+            return row["deck_url"] if row is not None else ""
+        finally:
+            db.close()
+
+    def _selected_deck_identity(self) -> tuple[str, str] | None:
+        selection = self.decks_tree.selection()
+        if not selection:
+            return None
+        values = self.decks_tree.item(selection[0], "values")
+        if len(values) < 2:
+            return None
+        return values[0], values[1]
+
+    def show_deck_context_menu(self, event) -> str:
+        row_id = self.decks_tree.identify_row(event.y)
+        if not row_id:
+            return "break"
+        self.decks_tree.selection_set(row_id)
+        self.decks_tree.focus(row_id)
+        self.decks_context_menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def reimport_selected_deck(self) -> None:
+        identity = self._selected_deck_identity()
+        if identity is None:
+            return
+        if any(button.instate(["disabled"]) for button in (self.import_button, self.tournament_button, self.wiki_match_button)):
+            return
+        code, site = identity
+        database_name = self.database_path.get().strip() or DEFAULT_DATABASE
+        source_url = self._deck_source_url(code, site)
+        self.import_button.configure(state="disabled")
+        self.tournament_button.configure(state="disabled")
+        self.progress.start(12)
+        self.status.set(f"Re-importing {code} from the {site} site...")
+        threading.Thread(target=self._reimport_worker, args=(code, site, source_url, database_name), daemon=True).start()
+
+    def delete_selected_deck(self) -> None:
+        identity = self._selected_deck_identity()
+        if identity is None:
+            return
+        if any(button.instate(["disabled"]) for button in (self.import_button, self.tournament_button, self.wiki_match_button)):
+            self.status.set("Wait for the current database task to finish before removing a deck.")
+            return
+        code, site = identity
+        if not messagebox.askyesno(
+            "Remove deck",
+            f"Remove deck {code} ({site}) from this database? Its stored card rows will also be deleted.",
+            parent=self,
+        ):
+            return
+        db = None
+        try:
+            db = open_database(Path(self.database_path.get().strip() or DEFAULT_DATABASE))
+            cursor = db.execute("DELETE FROM decks WHERE deck_code = ? AND site = ?", (code, site))
+            db.commit()
+            removed = cursor.rowcount > 0
+        except Exception as exc:
+            messagebox.showerror("Could not remove deck", str(exc), parent=self)
+            return
+        finally:
+            if db is not None:
+                db.close()
+        self.refresh_views()
+        self.status.set(f"Removed deck {code}." if removed else f"Deck {code} was not found.")
 
     def open_selected_card(self, _event) -> None:
         selection = self.report_tree.selection()

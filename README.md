@@ -46,7 +46,14 @@ VG-Paradox English Singles/Teams pages and Japanese result pages are supported.
 
 Use the filter bar to narrow both the imported-decks list and card report by
 tournament name, import date range, and nation. Dates are selected from the
-calendar controls. `Energy Generator` is excluded from card reports.
+calendar controls. `Energy Generator` is excluded from card reports. In the
+card report, click **Find JP matches** to look up Japanese-only cards in the
+Cardfight!! Vanguard Wiki. Lookups are saved locally; Japanese names drive the
+search, but automatic links require an exact card-number match to avoid merging
+distinct cards with the same name.
+Verified alternate printings then share a report entry, using the Wiki's
+English card name when available. The lookup runs in the background and
+requires an internet connection.
 
 **Interactive mode** — asks for a code, asks EN or JP, asks for an event
 name and placement, saves it, and loops until you leave the code blank:
@@ -71,6 +78,7 @@ after a tournament, or if you want to attach a placement after the fact.
 python decklog_tracker.py query
 python decklog_tracker.py query --top 25          # only the top 25
 python decklog_tracker.py query --unweighted       # raw copy counts, ignore placement
+python decklog_tracker.py match-wiki              # look up Japanese cards / printings
 ```
 
 **Point at a different database** with `--file`. The GUI's default game files
@@ -95,6 +103,9 @@ used when the canonical grade-3 card is already known.
 Known cross-language set renumberings are handled explicitly; for example,
 Japanese `DZ-SS14` maps to English `DZ-SS13` while unrelated set numbers remain
 unchanged.
+Wiki matches and attempted lookups are stored in `wiki_cards`,
+`wiki_card_prints`, and `wiki_lookup_attempts`; lookups only merge printings
+when the card number matches exactly.
 Deck updates are unique by site and deck code, card reports use indexed SQL
 aggregation, and unknown placement labels are added with weight `1`.
 

@@ -50,12 +50,15 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import html
 import json
 import re
 import sqlite3
 import sys
+import time
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -78,6 +81,8 @@ SITE_URLS = {
 }
 
 DEFAULT_DATABASE = str(Path(__file__).resolve().parent / "decklog_data.db")
+CARD_WIKI_API = "https://cardfight.fandom.com/api.php"
+WIKI_MATCHER_VERSION = 2
 DEFAULT_WEIGHTS = [
     ("1st", 5),
     ("2nd", 4),
@@ -126,6 +131,16 @@ class TournamentEntry:
     site: str
     deck_url: str
     player_or_team: str = ""
+
+
+@dataclass
+class WikiCard:
+    page_id: int
+    title: str
+    english_name: str
+    japanese_name: str
+    print_numbers: list[str]
+    url: str
 
 
 SUPPORTED_GAMES = ("Cardfight Vanguard", "Weiss Schwarz")
@@ -196,6 +211,224 @@ def canonical_card_number(card_number: str, site: str = "") -> str:
     return f"{set_code}/{card_index}"
 
 
+def _wiki_print_identity(card_number: str) -> str:
+    value = normalize_card_number(card_number)
+    return re.sub(r"(?<=\d)R$", "", value)
+
+
+def _wiki_card_fields(wikitext: str) -> dict[str, str]:
+    match = re.search(r"\{\{\s*(?:CardTable|DTable)\b", wikitext, flags=re.IGNORECASE)
+    if not match:
+        return {}
+    body_start = match.end()
+    depth = 1
+    cursor = body_start
+    while cursor < len(wikitext):
+        if wikitext.startswith("{{", cursor):
+            depth += 1
+            cursor += 2
+        elif wikitext.startswith("}}", cursor):
+            depth -= 1
+            if depth == 0:
+                break
+            cursor += 2
+        else:
+            cursor += 1
+    if depth != 0:
+        return {}
+
+    body = wikitext[body_start:cursor]
+    segments = []
+    segment_start = 0
+    template_depth = 0
+    link_depth = 0
+    cursor = 0
+    while cursor < len(body):
+        if body.startswith("{{", cursor):
+            template_depth += 1
+            cursor += 2
+        elif body.startswith("}}", cursor):
+            template_depth -= 1
+            cursor += 2
+        elif body.startswith("[[", cursor):
+            link_depth += 1
+            cursor += 2
+        elif body.startswith("]]", cursor):
+            link_depth -= 1
+            cursor += 2
+        elif body[cursor] == "|" and template_depth == 0 and link_depth == 0:
+            segments.append(body[segment_start:cursor])
+            segment_start = cursor + 1
+            cursor += 1
+        else:
+            cursor += 1
+    segments.append(body[segment_start:])
+
+    fields: dict[str, str] = {}
+    for segment in segments:
+        key, separator, value = segment.partition("=")
+        key = key.strip()
+        if separator and re.fullmatch(r"[a-zA-Z0-9_]+", key):
+            fields[key.lower()] = html.unescape(value).strip()
+    return fields
+
+
+def _normalize_wiki_name(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value or "")
+    normalized = normalized.replace("゠", "=").replace("＝", "=")
+    return re.sub(r"\s+", "", normalized).casefold()
+
+
+def _search_wiki_pages(search_term: str) -> list[dict]:
+    query = urllib.parse.urlencode({
+        "action": "query",
+        "generator": "search",
+        "gsrsearch": search_term,
+        "gsrnamespace": 0,
+        "gsrlimit": 20,
+        "prop": "revisions",
+        "rvprop": "content",
+        "rvslots": "main",
+        "format": "json",
+    })
+    request = urllib.request.Request(
+        f"{CARD_WIKI_API}?{query}",
+        headers={"Accept": "application/json", "User-Agent": "DeckLogTracker/1.0 (card lookup)"},
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        payload = json.load(response)
+    pages = payload.get("query", {}).get("pages", {})
+    if isinstance(pages, dict):
+        return sorted(pages.values(), key=lambda page: page.get("index", 0))
+    return pages
+
+
+def lookup_wiki_card(card_name: str, card_number: str, _name_only: bool = False) -> list[WikiCard]:
+    """Search by JP name and return only pages containing the exact print number."""
+    wanted_number = normalize_card_number(card_number)
+    wanted_identity = _wiki_print_identity(wanted_number)
+    if not wanted_number:
+        return []
+    search_term = card_name if _name_only else f"{card_name} {wanted_identity}"
+    pages = _search_wiki_pages(search_term)
+    matches = []
+    name_matches = []
+    wanted_name = _normalize_wiki_name(card_name)
+    for page in pages:
+        revisions = page.get("revisions") or []
+        if not revisions:
+            continue
+        revision = revisions[0]
+        content = revision.get("slots", {}).get("main", {}).get("*", "")
+        if not content:
+            content = revision.get("slots", {}).get("main", {}).get("content", "")
+        if not content:
+            content = revision.get("*", "")
+        fields = _wiki_card_fields(content)
+        if not fields:
+            continue
+
+        print_numbers = set()
+        for key, value in fields.items():
+            if re.fullmatch(r"set\d+", key):
+                plain_value = re.sub(r"<br\s*/?>", "\n", value, flags=re.IGNORECASE)
+                plain_value = re.sub(r"\[\[([^]|]+\|)?([^]]+)\]\]", r"\2", plain_value)
+                print_numbers.update(
+                    normalize_card_number(number)
+                    for number in re.findall(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9-]*", plain_value)
+                )
+        japanese_names = [fields.get("kanji", ""), fields.get("kana", ""), fields.get("jpname", "")]
+        normalized_japanese_names = {
+            _normalize_wiki_name(name)
+            for name in japanese_names if name
+        }
+        japanese_name = fields.get("kanji", "").strip() or fields.get("kana", "").strip()
+        wiki_card = WikiCard(
+            page_id=int(page["pageid"]),
+            title=page.get("title", ""),
+            english_name=(fields.get("enname") or fields.get("name") or page.get("title", "")).strip(),
+            japanese_name=japanese_name or fields.get("kana", "").strip(),
+            print_numbers=sorted(print_numbers),
+            url=f"https://cardfight.fandom.com/wiki/{urllib.parse.quote(page.get('title', '').replace(' ', '_'))}",
+        )
+        if wanted_identity in {_wiki_print_identity(number) for number in print_numbers}:
+            wiki_card.print_numbers = sorted(set(wiki_card.print_numbers) | {wanted_number})
+            matches.append(wiki_card)
+        elif wanted_name in normalized_japanese_names and fields.get("cardtype", "").strip().casefold() != "token":
+            name_matches.append(wiki_card)
+    if matches:
+        return matches
+    if len(name_matches) == 1:
+        name_matches[0].print_numbers = sorted(set(name_matches[0].print_numbers) | {wanted_number})
+        return name_matches
+    if not _name_only:
+        return lookup_wiki_card(card_name, card_number, _name_only=True)
+    return []
+
+
+def _store_wiki_matches(db: sqlite3.Connection, wiki_matches: list[WikiCard]) -> int:
+    printings = 0
+    for wiki_card in wiki_matches:
+        db.execute(
+            """INSERT OR REPLACE INTO wiki_cards
+               (page_id, title, english_name, japanese_name, page_url) VALUES (?, ?, ?, ?, ?)""",
+            (wiki_card.page_id, wiki_card.title, wiki_card.english_name, wiki_card.japanese_name, wiki_card.url),
+        )
+        for number in wiki_card.print_numbers:
+            canonical_number = canonical_card_number(number)
+            if canonical_number:
+                db.execute(
+                    "INSERT OR IGNORE INTO wiki_card_prints (page_id, canonical_card_number) VALUES (?, ?)",
+                    (wiki_card.page_id, canonical_number),
+                )
+                printings += 1
+    return printings
+
+
+def match_japanese_cards(db: sqlite3.Connection) -> tuple[int, int, int]:
+    """Look up untried Japanese cards; return (attempted, matched, printings)."""
+    cards = db.execute(
+        """SELECT DISTINCT card_number, card_name FROM cards
+           WHERE language = 'JP' AND card_name <> ''
+           ORDER BY card_number, card_name"""
+    ).fetchall()
+    attempted = matched = printings = 0
+    seen: set[tuple[str, str]] = set()
+    for row in cards:
+        card_number, card_name = row[0] or "", row[1] or ""
+        identity = (normalize_card_number(card_number), re.sub(r"\s+", "", card_name))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        lookup_key = identity[0] or f"name:{identity[1]}"
+        previous_attempt = db.execute(
+            "SELECT matched, matcher_version FROM wiki_lookup_attempts WHERE lookup_key = ?",
+            (lookup_key,),
+        ).fetchone()
+        if previous_attempt is not None and previous_attempt[1] >= WIKI_MATCHER_VERSION:
+            continue
+        if attempted:
+            time.sleep(0.2)
+        wiki_matches = lookup_wiki_card(card_name, card_number)
+        db.execute(
+            """INSERT INTO wiki_lookup_attempts
+               (lookup_key, card_name, attempted_at, matched, matcher_version)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(lookup_key) DO UPDATE SET
+                   card_name = excluded.card_name,
+                   attempted_at = excluded.attempted_at,
+                   matched = excluded.matched,
+                   matcher_version = excluded.matcher_version""",
+            (lookup_key, card_name, dt.datetime.now().isoformat(timespec="seconds"), bool(wiki_matches), WIKI_MATCHER_VERSION),
+        )
+        printings += _store_wiki_matches(db, wiki_matches)
+        attempted += 1
+        matched += bool(wiki_matches)
+        db.commit()
+    update_japanese_deck_archetypes(db)
+    return attempted, matched, printings
+
+
 def detect_card_language(card_number: str, name: str, site: str) -> str:
     value = unicodedata.normalize("NFKC", f"{card_number} {name}")
     if re.search(r"EN(?=-|$)", card_number.upper()):
@@ -226,15 +459,21 @@ def resolve_card_image(image_ref: str, site: str, game_title: str = "") -> str:
     return f"https://{host}/system/app/img/{value.lstrip('/')}"
 
 
-def _fetch_decklist_api(code: str, site: str) -> DeckResult | None:
+def _fetch_decklist_api(
+    code: str,
+    site: str,
+    page_url: str | None = None,
+    localized_japanese: bool = False,
+) -> DeckResult | None:
     """Fetch a deck from Deck Log's JSON endpoint when available."""
-    host = "decklog-en.bushiroad.com" if site == "EN" else "decklog.bushiroad.com"
-    page_url = f"https://{host}/view/{code}"
-    api_paths = ["system/app/api/view"]
-    if site == "EN":
-        api_paths.append("system/app-ja/api/view")
+    host = "decklog-en.bushiroad.com" if site == "EN" or localized_japanese else "decklog.bushiroad.com"
+    page_url = page_url or f"https://{host}/view/{code}"
+    if localized_japanese:
+        api_paths = ["system/app-ja/api/view"]
+    elif site == "EN":
+        api_paths = ["system/app/api/view", "system/app-ja/api/view"]
     else:
-        api_paths.append("system/app/api/view")
+        api_paths = ["system/app/api/view"]
     payload = None
     for api_path in api_paths:
         request = urllib.request.Request(
@@ -325,7 +564,22 @@ def infer_game_from_cards(cards: list[CardEntry]) -> str:
     return ""
 
 
-def fetch_decklist(code: str, site: str, debug_dir: Path | None = None, headless: bool = True) -> DeckResult:
+def _is_localized_japanese_deck_url(url: str, code: str) -> bool:
+    parsed = urllib.parse.urlsplit(url or "")
+    path = urllib.parse.unquote(parsed.path)
+    return (
+        (parsed.hostname or "").lower() == "decklog-en.bushiroad.com"
+        and re.fullmatch(rf"/ja/view/{re.escape(code)}/?", path, flags=re.IGNORECASE) is not None
+    )
+
+
+def fetch_decklist(
+    code: str,
+    site: str,
+    debug_dir: Path | None = None,
+    headless: bool = True,
+    source_url: str = "",
+) -> DeckResult:
     """Render a Deck Log page and scrape its card list.
 
     site must be "EN" or "JP".
@@ -335,11 +589,17 @@ def fetch_decklist(code: str, site: str, debug_dir: Path | None = None, headless
     if site not in SITE_URLS:
         raise ValueError(f"site must be one of {list(SITE_URLS)}, got {site!r}")
 
-    api_deck = _fetch_decklist_api(code, site)
+    localized_japanese = _is_localized_japanese_deck_url(source_url, code)
+    if localized_japanese:
+        site = "JP"
+        url = f"https://decklog-en.bushiroad.com/ja/view/{code}"
+    else:
+        url = SITE_URLS[site].format(code=code)
+
+    api_deck = _fetch_decklist_api(code, site, page_url=url, localized_japanese=localized_japanese)
     if api_deck is not None:
         return api_deck
 
-    url = SITE_URLS[site].format(code=code)
     last_error: Exception | None = None
 
     for attempt in range(3):
@@ -487,13 +747,14 @@ def fetch_tournament_entries(url: str, headless: bool = True) -> list[Tournament
                 links = row.locator("a[href]")
                 for link_index in range(links.count()):
                     href = (links.nth(link_index).get_attribute("href") or "").strip()
-                    match = re.search(r"decklog(?:-en)?\.bushiroad\.com/(?:ja/)?view/([^/?#]+)", href, flags=re.IGNORECASE)
+                    match = re.search(r"decklog(-en)?\.bushiroad\.com/(ja/)?view/([^/?#]+)", href, flags=re.IGNORECASE)
                     if not match:
                         continue
-                    site = "EN" if "decklog-en" in href.lower() else "JP"
+                    localized_japanese = bool(match.group(2))
+                    site = "JP" if localized_japanese or not match.group(1) else "EN"
                     entries.append(TournamentEntry(
                         rank=rank or "Unknown",
-                        deck_code=normalize_deck_code(match.group(1)),
+                        deck_code=normalize_deck_code(match.group(3)),
                         site=site,
                         deck_url=href,
                         player_or_team=player_or_team,
@@ -639,10 +900,39 @@ def open_database(path: Path) -> sqlite3.Connection:
             placement TEXT PRIMARY KEY,
             weight REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS wiki_lookup_attempts (
+            lookup_key TEXT PRIMARY KEY,
+            card_name TEXT NOT NULL,
+            attempted_at TEXT NOT NULL,
+            matched INTEGER NOT NULL DEFAULT 0,
+            matcher_version INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS wiki_cards (
+            page_id INTEGER PRIMARY KEY,
+            title TEXT NOT NULL,
+            english_name TEXT NOT NULL DEFAULT '',
+            japanese_name TEXT NOT NULL DEFAULT '',
+            page_url TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS wiki_card_prints (
+            page_id INTEGER NOT NULL REFERENCES wiki_cards(page_id) ON DELETE CASCADE,
+            canonical_card_number TEXT NOT NULL,
+            PRIMARY KEY (page_id, canonical_card_number)
+        );
         CREATE INDEX IF NOT EXISTS cards_name_idx ON cards(card_name);
         CREATE INDEX IF NOT EXISTS cards_deck_idx ON cards(deck_id);
         CREATE INDEX IF NOT EXISTS decks_event_idx ON decks(event);
     """)
+    lookup_columns = {row[1] for row in db.execute("PRAGMA table_info(wiki_lookup_attempts)")}
+    if "matched" not in lookup_columns:
+        db.execute("ALTER TABLE wiki_lookup_attempts ADD COLUMN matched INTEGER NOT NULL DEFAULT 0")
+    if "matcher_version" not in lookup_columns:
+        db.execute("ALTER TABLE wiki_lookup_attempts ADD COLUMN matcher_version INTEGER NOT NULL DEFAULT 0")
+    db.execute(
+        """UPDATE wiki_lookup_attempts SET matched = 1, matcher_version = ?
+                     WHERE lookup_key IN (SELECT canonical_card_number FROM wiki_card_prints)""",
+        (WIKI_MATCHER_VERSION,),
+    )
     deck_columns = {row[1] for row in db.execute("PRAGMA table_info(decks)")}
     if "tournament_date" not in deck_columns:
         db.execute("ALTER TABLE decks ADD COLUMN tournament_date TEXT NOT NULL DEFAULT ''")
@@ -658,6 +948,7 @@ def open_database(path: Path) -> sqlite3.Connection:
     if "language" not in card_columns:
         db.execute("ALTER TABLE cards ADD COLUMN language TEXT NOT NULL DEFAULT ''")
     db.execute("CREATE INDEX IF NOT EXISTS cards_canonical_number_idx ON cards(canonical_card_number)")
+    db.execute("CREATE INDEX IF NOT EXISTS wiki_card_prints_number_idx ON wiki_card_prints(canonical_card_number)")
     db.execute("CREATE INDEX IF NOT EXISTS decks_archetype_number_idx ON decks(archetype_card_number)")
     for row in db.execute(
         """SELECT cards.id, cards.card_number, cards.card_name, cards.site, cards.image_ref, decks.game
@@ -675,6 +966,7 @@ def open_database(path: Path) -> sqlite3.Connection:
         DEFAULT_WEIGHTS,
     )
     db.commit()
+    update_japanese_deck_archetypes(db)
     return db
 
 
@@ -705,6 +997,133 @@ def get_placement_weight(db: sqlite3.Connection, placement: str) -> float:
     return 1.0
 
 
+def _contains_japanese_text(value: str) -> bool:
+    return bool(re.search(r"[\u3040-\u30ff\u3400-\u9fff]", value or ""))
+
+
+def _resolve_archetype_name(
+    db: sqlite3.Connection,
+    card_number: str,
+    fallback: str,
+    japanese_name: str = "",
+) -> str:
+    canonical_number = canonical_card_number(card_number)
+    print_identity = _wiki_print_identity(canonical_number)
+    wiki_page = None
+    if japanese_name:
+        normalized_name = _normalize_wiki_name(japanese_name)
+        matching_pages = [
+            row[0] for row in db.execute(
+                "SELECT page_id, japanese_name FROM wiki_cards WHERE japanese_name <> '' ORDER BY page_id"
+            )
+            if _normalize_wiki_name(row[1]) == normalized_name
+        ]
+        for print_number in (canonical_number, print_identity):
+            if not matching_pages or not print_number:
+                continue
+            placeholders = ", ".join("?" for _ in matching_pages)
+            number_matches = [
+                row[0] for row in db.execute(
+                    f"""SELECT page_id FROM wiki_card_prints
+                        WHERE canonical_card_number = ? AND page_id IN ({placeholders})
+                        ORDER BY page_id""",
+                    [print_number, *matching_pages],
+                )
+            ]
+            if len(number_matches) == 1:
+                wiki_page = (number_matches[0],)
+                break
+            if number_matches:
+                matching_pages = number_matches
+        if wiki_page is None and len(matching_pages) == 1:
+            wiki_page = (matching_pages[0],)
+    if wiki_page is None:
+        wiki_page = db.execute(
+            """SELECT page_id FROM wiki_card_prints
+               WHERE canonical_card_number IN (?, ?) ORDER BY page_id LIMIT 1""",
+            (canonical_number, print_identity),
+        ).fetchone()
+    related_numbers = [canonical_number]
+    if wiki_page is not None:
+        related_numbers.extend(
+            row[0] for row in db.execute(
+                "SELECT canonical_card_number FROM wiki_card_prints WHERE page_id = ?",
+                (wiki_page[0],),
+            )
+        )
+    related_numbers = list(dict.fromkeys(number for number in related_numbers if number))
+    placeholders = ", ".join("?" for _ in related_numbers)
+    wiki_name = None
+    if wiki_page is not None:
+        wiki_name = db.execute(
+            "SELECT english_name FROM wiki_cards WHERE page_id = ? AND english_name <> ''",
+            (wiki_page[0],),
+        ).fetchone()
+    if japanese_name and wiki_name is not None:
+        official_name = db.execute(
+            f"""SELECT card_name FROM cards
+                WHERE language = 'EN' AND card_name <> ''
+                  AND canonical_card_number IN ({placeholders})
+                ORDER BY id""",
+            related_numbers,
+        ).fetchall()
+        matching_official_name = next(
+            (row[0] for row in official_name
+             if not _contains_japanese_text(row[0])
+             and re.sub(r"\s+", "", row[0]).casefold() == re.sub(r"\s+", "", wiki_name[0]).casefold()),
+            None,
+        )
+        return matching_official_name or wiki_name[0]
+    english_names = db.execute(
+        f"""SELECT card_name FROM cards
+            WHERE language = 'EN' AND card_name <> ''
+              AND canonical_card_number IN ({placeholders})
+            ORDER BY id""",
+        related_numbers,
+    ).fetchall()
+    for english_name in english_names:
+        if not _contains_japanese_text(english_name[0]):
+            return english_name[0]
+    if wiki_name is not None:
+        return wiki_name[0]
+    english_archetypes = db.execute(
+        f"""SELECT archetype FROM decks
+            WHERE site = 'EN' AND archetype <> ''
+              AND archetype_card_number IN ({placeholders})
+            ORDER BY id""",
+        related_numbers,
+    ).fetchall()
+    for english_archetype in english_archetypes:
+        if not _contains_japanese_text(english_archetype[0]):
+            return english_archetype[0]
+    return fallback
+
+
+def update_japanese_deck_archetypes(db: sqlite3.Connection) -> int:
+    """Apply the best known English name to every deck with a mapped archetype print."""
+    rows = db.execute(
+        """SELECT id, site, archetype, archetype_card_number FROM decks
+           WHERE archetype_card_number <> ''"""
+    ).fetchall()
+    updated = 0
+    for row in rows:
+        ride_card = db.execute(
+            """SELECT card_name FROM cards
+               WHERE deck_id = ? AND section = 'ride' AND language = 'JP'
+                 AND canonical_card_number IN (?, ?)
+               ORDER BY id LIMIT 1""",
+            (row[0], row[3], _wiki_print_identity(row[3])),
+        ).fetchone()
+        japanese_name = ride_card[0] if ride_card is not None else ""
+        archetype = _resolve_archetype_name(db, row[3], row[2], japanese_name)
+        if archetype != row[2]:
+            db.execute("UPDATE decks SET archetype = ? WHERE id = ?", (archetype, row[0]))
+            updated += 1
+    if updated:
+        db.commit()
+    return updated
+
+
 def save_deck(
     db: sqlite3.Connection,
     deck: DeckResult,
@@ -732,25 +1151,34 @@ def save_deck(
     weight = get_placement_weight(db, placement) if placement else 1.0
     all_cards = deck.cards + deck.ride_line
     archetype_card_number = canonical_card_number(deck.archetype_card_number, deck.site)
-    archetype = deck.archetype
-    if archetype_card_number:
-        english_name = db.execute(
-            """SELECT card_name FROM cards
-               WHERE canonical_card_number = ? AND language = 'EN'
-                 AND card_name <> '' ORDER BY id LIMIT 1""",
-            (archetype_card_number,),
+    japanese_name = deck.archetype if _contains_japanese_text(deck.archetype) else ""
+    archetype = _resolve_archetype_name(db, archetype_card_number, deck.archetype, japanese_name)
+    if archetype_card_number and _contains_japanese_text(archetype):
+        mapped_page = db.execute(
+            """SELECT 1 FROM wiki_card_prints
+               WHERE canonical_card_number IN (?, ?) LIMIT 1""",
+            (archetype_card_number, _wiki_print_identity(archetype_card_number)),
         ).fetchone()
-        if english_name is not None:
-            archetype = english_name[0]
-        else:
-            existing_name = db.execute(
-                """SELECT archetype FROM decks
-                   WHERE archetype_card_number = ? AND archetype <> ''
-                   ORDER BY CASE WHEN site = 'EN' THEN 0 ELSE 1 END, id LIMIT 1""",
-                (archetype_card_number,),
-            ).fetchone()
-            if existing_name is not None:
-                archetype = existing_name[0]
+        if mapped_page is None:
+            try:
+                wiki_matches = lookup_wiki_card(deck.archetype, archetype_card_number)
+            except Exception:
+                wiki_matches = []
+            if wiki_matches:
+                _store_wiki_matches(db, wiki_matches)
+                lookup_key = normalize_card_number(archetype_card_number)
+                db.execute(
+                    """INSERT INTO wiki_lookup_attempts
+                       (lookup_key, card_name, attempted_at, matched, matcher_version)
+                       VALUES (?, ?, ?, 1, ?)
+                       ON CONFLICT(lookup_key) DO UPDATE SET
+                           card_name = excluded.card_name,
+                           attempted_at = excluded.attempted_at,
+                           matched = 1,
+                           matcher_version = excluded.matcher_version""",
+                    (lookup_key, deck.archetype, dt.datetime.now().isoformat(timespec="seconds"), WIKI_MATCHER_VERSION),
+                )
+                archetype = _resolve_archetype_name(db, archetype_card_number, deck.archetype)
     db.execute("DELETE FROM decks WHERE deck_code = ? AND site = ?", (deck.code, deck.site))
     cursor = db.execute(
         """INSERT INTO decks
@@ -773,6 +1201,7 @@ def save_deck(
                       resolve_card_image(c.image_ref, deck.site, deck.game_title))
                  for c in all_cards],
     )
+    update_japanese_deck_archetypes(db)
     db.commit()
 
 
@@ -814,24 +1243,32 @@ def query_common_cards(
     if archetype.strip() and archetype.strip().lower() != "all archetypes":
         filters.append("lower(decks.archetype) = lower(?)")
         params.append(archetype.strip())
-    group_key = "COALESCE(NULLIF(cards.canonical_card_number, ''), NULLIF(cards.card_number, ''), 'name:' || lower(cards.card_name))"
+    base_key = "COALESCE(NULLIF(cards.canonical_card_number, ''), NULLIF(cards.card_number, ''), 'name:' || lower(cards.card_name))"
+    wiki_page = f"(SELECT page_id FROM wiki_card_prints WHERE canonical_card_number = {base_key} ORDER BY page_id LIMIT 1)"
+    group_key = f"COALESCE('wiki:' || {wiki_page}, {base_key})"
+    english_base_key = "COALESCE(NULLIF(english.canonical_card_number, ''), NULLIF(english.card_number, ''), 'name:' || lower(english.card_name))"
+    english_wiki_page = f"(SELECT page_id FROM wiki_card_prints WHERE canonical_card_number = {english_base_key} ORDER BY page_id LIMIT 1)"
+    english_group_key = f"COALESCE('wiki:' || {english_wiki_page}, {english_base_key})"
     if top:
         params.append(top)
     rows = db.execute(
                 f"""SELECT COALESCE(
-                                             (SELECT english.card_name FROM cards AS english
-                                                WHERE english.language = 'EN'
-                                                    AND english.card_name <> ''
-                                                    AND COALESCE(NULLIF(english.canonical_card_number, ''), NULLIF(english.card_number, '')) = {group_key}
-                                                ORDER BY english.id LIMIT 1),
-                                             MIN(cards.card_name)
-                                     ) AS name,
+                                                     (SELECT english.card_name FROM cards AS english
+                                                        WHERE english.language = 'EN'
+                                                            AND english.card_name <> ''
+                                                            AND {english_group_key} = {group_key}
+                                                        ORDER BY english.id LIMIT 1),
+                                                     (SELECT wiki_cards.english_name FROM wiki_cards
+                                                        WHERE 'wiki:' || wiki_cards.page_id = {group_key}
+                                                            AND wiki_cards.english_name <> '' LIMIT 1),
+                                                     MIN(cards.card_name)
+                                             ) AS name,
                                      COALESCE(MIN(NULLIF(cards.canonical_card_number, '')), MIN(NULLIF(cards.card_number, '')), '') AS card_number,
                                      COALESCE(
                                              (SELECT english.image_ref FROM cards AS english
                                                 WHERE english.language = 'EN'
                                                     AND english.image_ref <> ''
-                                                    AND COALESCE(NULLIF(english.canonical_card_number, ''), NULLIF(english.card_number, '')) = {group_key}
+                                                    AND {english_group_key} = {group_key}
                                                 ORDER BY english.id LIMIT 1),
                                              MIN(NULLIF(cards.image_ref, '')), ''
                                      ) AS image_ref,
@@ -945,6 +1382,16 @@ def cmd_query(args: argparse.Namespace) -> None:
     print_report(rows, weighted=not args.unweighted)
 
 
+def cmd_match_wiki(args: argparse.Namespace) -> None:
+    db_path = Path(args.file)
+    if not db_path.exists():
+        print(f"No database found at {db_path}. Add some decks first.")
+        return
+    db = open_database(db_path)
+    attempted, matched, printings = match_japanese_cards(db)
+    print(f"Wiki lookup complete: {attempted} cards checked, {matched} matched, {printings} printings indexed.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--file", default=DEFAULT_DATABASE, help=f"SQLite database path (default: {DEFAULT_DATABASE})")
@@ -962,6 +1409,9 @@ def main() -> None:
     p_query.add_argument("--top", type=int, default=None, help="Only show the top N cards")
     p_query.add_argument("--unweighted", action="store_true", help="Ignore placement weighting, just sum raw copies")
     p_query.set_defaults(func=cmd_query)
+
+    p_wiki = sub.add_parser("match-wiki", help="Look up Japanese cards and link verified Wiki printings")
+    p_wiki.set_defaults(func=cmd_match_wiki)
 
     args = parser.parse_args()
 
